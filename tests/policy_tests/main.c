@@ -264,6 +264,17 @@ static void fill_tcp_header(uint8_t *packet, uint32_t l4_off)
     packet[l4_off + 12u] = 0x50u;
 }
 
+static void fill_bytes(uint8_t *packet,
+                       uint32_t off,
+                       const uint8_t *src,
+                       uint32_t count)
+{
+    uint32_t i;
+
+    for (i = 0u; i < count; i++)
+        packet[off + i] = src[i];
+}
+
 static void fill_udp_header(uint8_t *packet, uint32_t l4_off)
 {
     uint32_t i;
@@ -387,6 +398,10 @@ int main(void)
     uint8_t truncated_eth[10] = {0};
     uint8_t truncated_ipv4[ETH_HDR_LEN + 10] = {0};
     uint8_t ipv4_frag_udp[ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN] = {0};
+    uint8_t ipv4_tcp_tls_appdata[ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN + 5 + 16 + 32] = {0};
+    uint8_t ipv4_tcp_tls_handshake[ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN + 5 + 16] = {0};
+    uint8_t ipv4_tcp_tls_bad_version[ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN + 5 + 16] = {0};
+    uint8_t ipv4_tcp_tls_too_short[ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN + 4] = {0};
     size_t generated_case_index;
     struct pcapc_capture_decision decision;
     struct pcapc_capture_config cfg;
@@ -515,6 +530,101 @@ int main(void)
     expect_u16(&state, "ipv4 frag udp l3_off", decision.l3_off, ETH_HDR_LEN);
     expect_u16(&state, "ipv4 frag udp l4_off", decision.l4_off, 0u);
     expect_u16(&state, "ipv4 frag udp payload_off", decision.payload_off, 0u);
+
+    cfg.default_snaplen = 2048u;
+    cfg.encrypted_snaplen = 64u;
+    cfg.max_capture_len = 2048u;
+    cfg.flags = 0u;
+
+    fill_eth_header( ipv4_tcp_tls_appdata, ETHERTYPE_IPV4);
+    fill_ipv4_header(ipv4_tcp_tls_appdata, ETH_HDR_LEN, IPPROTO_TCP, 0u);
+    fill_tcp_header(ipv4_tcp_tls_appdata, ETH_HDR_LEN + IPV4_HDR_LEN);
+    {
+        static const uint8_t tls_appdata_record[] = {
+            0x17, 0x03, 0x03, 0x00, 0x10,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+        };
+        fill_bytes(ipv4_tcp_tls_appdata,
+                   ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN,
+                   tls_appdata_record,
+                   sizeof(tls_appdata_record));
+    }
+    decision = pcapc_decide_l2_packet(ipv4_tcp_tls_appdata, sizeof(ipv4_tcp_tls_appdata), &cfg);
+    expect_u32(&state, "ipv4 tcp tls appdata cap_len", decision.cap_len, 64u);
+    expect_reason(&state, "ipv4 tcp tls appdata reason", decision.reason, PCAPC_REASON_TLS_APP_DATA);
+    expect_u8(&state, "ipv4 tcp tls appdata ip_proto", decision.ip_proto, 4u);
+    expect_u8(&state, "ipv4 tcp tls appdata l4_proto", decision.l4_proto, IPPROTO_TCP);
+    expect_u16(&state, "ipv4 tcp tls appdata l3_off", decision.l3_off, ETH_HDR_LEN);
+    expect_u16(&state, "ipv4 tcp tls appdata l4_off", decision.l4_off, ETH_HDR_LEN + IPV4_HDR_LEN);
+    expect_u16(&state, "ipv4 tcp tls appdata payload_off", decision.payload_off, ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN);
+
+    fill_eth_header(ipv4_tcp_tls_handshake, ETHERTYPE_IPV4);
+    fill_ipv4_header(ipv4_tcp_tls_handshake, ETH_HDR_LEN, IPPROTO_TCP, 0u);
+    fill_tcp_header(ipv4_tcp_tls_handshake, ETH_HDR_LEN + IPV4_HDR_LEN);
+    {
+        static const uint8_t tls_handshake_record[] = {
+            0x16, 0x03, 0x03, 0x00, 0x10,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+        };
+        fill_bytes(ipv4_tcp_tls_handshake,
+                   ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN,
+                   tls_handshake_record,
+                   sizeof(tls_handshake_record));
+    }
+    decision = pcapc_decide_l2_packet(ipv4_tcp_tls_handshake, sizeof(ipv4_tcp_tls_handshake), &cfg);
+    expect_u32(&state, "ipv4 tcp tls handshake cap_len", decision.cap_len, sizeof(ipv4_tcp_tls_handshake));
+    expect_reason(&state, "ipv4 tcp tls handshake reason", decision.reason, PCAPC_REASON_TCP);
+    expect_u8(&state, "ipv4 tcp tls handshake ip_proto", decision.ip_proto, 4u);
+    expect_u8(&state, "ipv4 tcp tls handshake l4_proto", decision.l4_proto, IPPROTO_TCP);
+    expect_u16(&state, "ipv4 tcp tls handshake l3_off", decision.l3_off, ETH_HDR_LEN);
+    expect_u16(&state, "ipv4 tcp tls handshake l4_off", decision.l4_off, ETH_HDR_LEN + IPV4_HDR_LEN);
+    expect_u16(&state, "ipv4 tcp tls handshake payload_off", decision.payload_off, ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN);
+
+    fill_eth_header(ipv4_tcp_tls_bad_version, ETHERTYPE_IPV4);
+    fill_ipv4_header(ipv4_tcp_tls_bad_version, ETH_HDR_LEN, IPPROTO_TCP, 0u);
+    fill_tcp_header(ipv4_tcp_tls_bad_version, ETH_HDR_LEN + IPV4_HDR_LEN);
+    {
+        static const uint8_t tls_bad_version_record[] = {
+            0x17, 0x02, 0x00, 0x00, 0x10,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+        };
+        fill_bytes(ipv4_tcp_tls_bad_version,
+                   ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN,
+                   tls_bad_version_record,
+                   sizeof(tls_bad_version_record));
+    }
+    decision = pcapc_decide_l2_packet(ipv4_tcp_tls_bad_version, sizeof(ipv4_tcp_tls_bad_version), &cfg);
+    expect_u32(&state, "ipv4 tcp tls bad version cap_len", decision.cap_len, sizeof(ipv4_tcp_tls_bad_version));
+    expect_reason(&state, "ipv4 tcp tls bad version reason", decision.reason, PCAPC_REASON_TCP);
+    expect_u8(&state, "ipv4 tcp tls bad version ip_proto", decision.ip_proto, 4u);
+    expect_u8(&state, "ipv4 tcp tls bad version l4_proto", decision.l4_proto, IPPROTO_TCP);
+    expect_u16(&state, "ipv4 tcp tls bad version l3_off", decision.l3_off, ETH_HDR_LEN);
+    expect_u16(&state, "ipv4 tcp tls bad version l4_off", decision.l4_off, ETH_HDR_LEN + IPV4_HDR_LEN);
+    expect_u16(&state, "ipv4 tcp tls bad version payload_off", decision.payload_off, ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN);
+
+    fill_eth_header(ipv4_tcp_tls_too_short, ETHERTYPE_IPV4);
+    fill_ipv4_header(ipv4_tcp_tls_too_short, ETH_HDR_LEN, IPPROTO_TCP, 0u);
+    fill_tcp_header(ipv4_tcp_tls_too_short, ETH_HDR_LEN + IPV4_HDR_LEN);
+    {
+        static const uint8_t tls_too_short_record[] = {
+            0x17, 0x03, 0x03, 0x00
+        };
+        fill_bytes(ipv4_tcp_tls_too_short,
+                   ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN,
+                   tls_too_short_record,
+                   sizeof(tls_too_short_record));
+    }
+    decision = pcapc_decide_l2_packet(ipv4_tcp_tls_too_short, sizeof(ipv4_tcp_tls_too_short), &cfg);
+    expect_u32(&state, "ipv4 tcp tls short cap_len", decision.cap_len, sizeof(ipv4_tcp_tls_too_short));
+    expect_reason(&state, "ipv4 tcp tls short reason", decision.reason, PCAPC_REASON_TCP);
+    expect_u8(&state, "ipv4 tcp tls short ip_proto", decision.ip_proto, 4u);
+    expect_u8(&state, "ipv4 tcp tls short l4_proto", decision.l4_proto, IPPROTO_TCP);
+    expect_u16(&state, "ipv4 tcp tls short l3_off", decision.l3_off, ETH_HDR_LEN);
+    expect_u16(&state, "ipv4 tcp tls short l4_off", decision.l4_off, ETH_HDR_LEN + IPV4_HDR_LEN);
+    expect_u16(&state, "ipv4 tcp tls short payload_off", decision.payload_off, ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN);
 
     for (generated_case_index = 0u;
          generated_case_index < sizeof(generated_cases) / sizeof(generated_cases[0]);
