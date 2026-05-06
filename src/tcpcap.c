@@ -11,9 +11,11 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
+#include "shared/packet_policy_types.h"
 #include "tcpcap.skel.h"
 
 #define SNAPLEN 256
+#define MAX_CAPTURE_LEN 4096
 
 #define DIR_INGRESS 0
 #define DIR_EGRESS  1
@@ -30,9 +32,14 @@ struct event {
     uint32_t ifindex;
     uint32_t pkt_len;
     uint32_t cap_len;
+    uint16_t l3_off;
+    uint16_t l4_off;
+    uint16_t payload_off;
     uint8_t direction;
-    uint8_t _pad[3];
-    uint8_t data[SNAPLEN];
+    uint8_t ip_proto;
+    uint8_t l4_proto;
+    uint8_t reason;
+    uint8_t data[MAX_CAPTURE_LEN];
 };
 
 struct pcap_global_header {
@@ -116,7 +123,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     struct app_state *state = ctx;
     const struct event *e = data;
 
-    if (e->cap_len > SNAPLEN)
+    if (e->cap_len > MAX_CAPTURE_LEN)
         return 0;
 
     struct pcap_packet_header ph = {};
@@ -166,6 +173,13 @@ int main(int argc, char **argv)
     struct app_state state = {};
 
     unsigned int ifindex;
+    uint32_t config_key = 0;
+    struct pcapc_capture_config capture_config = {
+        256u,
+        8u,
+        256u,
+        0u
+    };
     int ingress_fd;
     int egress_fd;
     int err = 0;
@@ -205,6 +219,17 @@ int main(int argc, char **argv)
     skel = tcpcap_bpf__open_and_load();
     if (!skel) {
         fprintf(stderr, "failed to open/load BPF skeleton\n");
+        err = 1;
+        goto cleanup;
+    }
+
+    err = bpf_map_update_elem(bpf_map__fd(skel->maps.capture_config),
+                              &config_key,
+                              &capture_config,
+                              BPF_ANY);
+    if (err) {
+        fprintf(stderr, "failed to initialize capture config map: %s\n",
+                strerror(errno));
         err = 1;
         goto cleanup;
     }

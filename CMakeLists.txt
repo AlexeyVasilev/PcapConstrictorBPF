@@ -7,7 +7,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 add_library(packet_policy src/core/packet_policy.c)
-target_include_directories(packet_policy PUBLIC src/core)
+target_include_directories(packet_policy PUBLIC src/core src/shared)
 
 add_executable(policy_tests tests/policy_tests/main.c)
 target_include_directories(policy_tests PRIVATE tests/policy_tests)

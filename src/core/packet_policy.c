@@ -25,31 +25,31 @@ enum {
     PCAPC_TLS_APPLICATION_DATA = 0x17u
 };
 
-static uint16_t load_be16(const uint8_t *p)
+static pcapc_u16 load_be16(const pcapc_u8 *p)
 {
-    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+    return (pcapc_u16)(((pcapc_u16)p[0] << 8) | (pcapc_u16)p[1]);
 }
 
-static uint32_t load_be32(const uint8_t *p)
+static pcapc_u32 load_be32(const pcapc_u8 *p)
 {
-    return ((uint32_t)p[0] << 24) |
-           ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8) |
-           (uint32_t)p[3];
+    return ((pcapc_u32)p[0] << 24) |
+           ((pcapc_u32)p[1] << 16) |
+           ((pcapc_u32)p[2] << 8) |
+           (pcapc_u32)p[3];
 }
 
-static uint32_t min_u32(uint32_t a, uint32_t b)
+static pcapc_u32 min_u32(pcapc_u32 a, pcapc_u32 b)
 {
     return a < b ? a : b;
 }
 
-static int find_tls_application_data_record_start(const uint8_t *data,
-                                                  uint32_t len,
-                                                  uint32_t payload_off,
-                                                  uint32_t *app_data_off)
+static int find_tls_application_data_record_start(const pcapc_u8 *data,
+                                                  pcapc_u32 len,
+                                                  pcapc_u32 payload_off,
+                                                  pcapc_u32 *app_data_off)
 {
-    uint32_t off;
-    uint32_t record_index;
+    pcapc_u32 off;
+    pcapc_u32 record_index;
 
     if (payload_off >= len)
         return 0;
@@ -57,11 +57,11 @@ static int find_tls_application_data_record_start(const uint8_t *data,
     off = payload_off;
 
     for (record_index = 0u; record_index < PCAPC_TLS_MAX_RECORDS_SCANNED; record_index++) {
-        uint8_t content_type;
-        uint8_t major;
-        uint8_t minor;
-        uint16_t record_len;
-        uint32_t next_off;
+        pcapc_u8 content_type;
+        pcapc_u8 major;
+        pcapc_u8 minor;
+        pcapc_u16 record_len;
+        pcapc_u32 next_off;
 
         if (off >= len)
             return 0;
@@ -91,7 +91,7 @@ static int find_tls_application_data_record_start(const uint8_t *data,
             return 0;
         }
 
-        next_off = off + PCAPC_TLS_RECORD_HDR_LEN + (uint32_t)record_len;
+        next_off = off + PCAPC_TLS_RECORD_HDR_LEN + (pcapc_u32)record_len;
         if (next_off > len)
             return 0;
 
@@ -102,8 +102,8 @@ static int find_tls_application_data_record_start(const uint8_t *data,
 }
 
 struct pcapc_capture_decision
-pcapc_decide_l2_packet(const uint8_t *data,
-                       uint32_t len,
+pcapc_decide_l2_packet(const pcapc_u8 *data,
+                       pcapc_u32 len,
                        const struct pcapc_capture_config *cfg)
 {
     static const struct pcapc_capture_config default_cfg = {
@@ -115,9 +115,9 @@ pcapc_decide_l2_packet(const uint8_t *data,
 
     const struct pcapc_capture_config *active_cfg = cfg ? cfg : &default_cfg;
     struct pcapc_capture_decision decision = {0};
-    uint32_t l3_off;
-    uint16_t ether_type;
-    uint32_t vlan_count;
+    pcapc_u32 l3_off;
+    pcapc_u16 ether_type;
+    pcapc_u32 vlan_count;
 
     decision.reason = PCAPC_REASON_DEFAULT;
 
@@ -153,12 +153,12 @@ pcapc_decide_l2_packet(const uint8_t *data,
     decision.l3_off = (uint16_t)l3_off;
 
     if (ether_type == PCAPC_ETHERTYPE_IPV4) {
-        uint32_t ipv4_off = l3_off;
-        uint8_t version_ihl;
-        uint32_t ipv4_hdr_len;
-        uint8_t l4_proto;
-        uint16_t frag_field;
-        uint32_t l4_off;
+        pcapc_u32 ipv4_off = l3_off;
+        pcapc_u8 version_ihl;
+        pcapc_u32 ipv4_hdr_len;
+        pcapc_u8 l4_proto;
+        pcapc_u16 frag_field;
+        pcapc_u32 l4_off;
 
         if (len < ipv4_off + PCAPC_IPV4_MIN_HDR_LEN) {
             decision.reason = PCAPC_REASON_PARSE_ERROR;
@@ -166,7 +166,7 @@ pcapc_decide_l2_packet(const uint8_t *data,
         }
 
         version_ihl = data[ipv4_off];
-        ipv4_hdr_len = (uint32_t)(version_ihl & 0x0Fu) * 4u;
+        ipv4_hdr_len = (pcapc_u32)(version_ihl & 0x0Fu) * 4u;
         if ((version_ihl >> 4) != 4u || ipv4_hdr_len < PCAPC_IPV4_MIN_HDR_LEN) {
             decision.reason = PCAPC_REASON_PARSE_ERROR;
             return decision;
@@ -188,17 +188,17 @@ pcapc_decide_l2_packet(const uint8_t *data,
         l4_off = ipv4_off + ipv4_hdr_len;
 
         if (l4_proto == PCAPC_IPPROTO_TCP) {
-            uint8_t data_offset_words;
-            uint32_t tcp_hdr_len;
-            uint32_t payload_off;
+            pcapc_u8 data_offset_words;
+            pcapc_u32 tcp_hdr_len;
+            pcapc_u32 payload_off;
 
             if (len < l4_off + PCAPC_TCP_MIN_HDR_LEN) {
                 decision.reason = PCAPC_REASON_PARSE_ERROR;
                 return decision;
             }
 
-            data_offset_words = (uint8_t)(data[l4_off + 12u] >> 4);
-            tcp_hdr_len = (uint32_t)data_offset_words * 4u;
+            data_offset_words = (pcapc_u8)(data[l4_off + 12u] >> 4);
+            tcp_hdr_len = (pcapc_u32)data_offset_words * 4u;
             if (data_offset_words < 5u) {
                 decision.reason = PCAPC_REASON_PARSE_ERROR;
                 return decision;
@@ -216,10 +216,10 @@ pcapc_decide_l2_packet(const uint8_t *data,
             decision.payload_off = (uint16_t)payload_off;
 
             if (payload_off < len) {
-                uint32_t app_data_off;
+                pcapc_u32 app_data_off;
 
                 if (find_tls_application_data_record_start(data, len, payload_off, &app_data_off)) {
-                    uint32_t tls_cap_len;
+                    pcapc_u32 tls_cap_len;
 
                     decision.reason = PCAPC_REASON_TLS_APP_DATA;
                     if (active_cfg->encrypted_snaplen > UINT32_MAX - app_data_off)
@@ -251,10 +251,10 @@ pcapc_decide_l2_packet(const uint8_t *data,
     }
 
     if (ether_type == PCAPC_ETHERTYPE_IPV6) {
-        uint32_t ipv6_off = l3_off;
-        uint32_t vtc_flow;
-        uint8_t next_header;
-        uint32_t l4_off;
+        pcapc_u32 ipv6_off = l3_off;
+        pcapc_u32 vtc_flow;
+        pcapc_u8 next_header;
+        pcapc_u32 l4_off;
 
         if (len < ipv6_off + PCAPC_IPV6_HDR_LEN) {
             decision.reason = PCAPC_REASON_PARSE_ERROR;
@@ -274,17 +274,17 @@ pcapc_decide_l2_packet(const uint8_t *data,
         l4_off = ipv6_off + PCAPC_IPV6_HDR_LEN;
 
         if (next_header == PCAPC_IPPROTO_TCP) {
-            uint8_t data_offset_words;
-            uint32_t tcp_hdr_len;
-            uint32_t payload_off;
+            pcapc_u8 data_offset_words;
+            pcapc_u32 tcp_hdr_len;
+            pcapc_u32 payload_off;
 
             if (len < l4_off + PCAPC_TCP_MIN_HDR_LEN) {
                 decision.reason = PCAPC_REASON_PARSE_ERROR;
                 return decision;
             }
 
-            data_offset_words = (uint8_t)(data[l4_off + 12u] >> 4);
-            tcp_hdr_len = (uint32_t)data_offset_words * 4u;
+            data_offset_words = (pcapc_u8)(data[l4_off + 12u] >> 4);
+            tcp_hdr_len = (pcapc_u32)data_offset_words * 4u;
             if (data_offset_words < 5u) {
                 decision.reason = PCAPC_REASON_PARSE_ERROR;
                 return decision;
@@ -302,10 +302,10 @@ pcapc_decide_l2_packet(const uint8_t *data,
             decision.payload_off = (uint16_t)payload_off;
 
             if (payload_off < len) {
-                uint32_t app_data_off;
+                pcapc_u32 app_data_off;
 
                 if (find_tls_application_data_record_start(data, len, payload_off, &app_data_off)) {
-                    uint32_t tls_cap_len;
+                    pcapc_u32 tls_cap_len;
 
                     decision.reason = PCAPC_REASON_TLS_APP_DATA;
                     if (active_cfg->encrypted_snaplen > UINT32_MAX - app_data_off)
