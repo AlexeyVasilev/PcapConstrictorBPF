@@ -4,6 +4,10 @@
 
 struct pcapc_capture_config {
     uint32_t default_snaplen;
+    /* For encrypted TLS/QUIC policy decisions, encrypted_snaplen is the
+     * number of bytes to keep starting at the first encrypted/protected
+     * record or payload, not the total packet cap length.
+     */
     uint32_t encrypted_snaplen;
     uint32_t max_capture_len;
     uint32_t flags;

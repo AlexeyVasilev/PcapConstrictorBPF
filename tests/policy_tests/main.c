@@ -430,7 +430,7 @@ int main(void)
             "tls_data_1__packet_1",
             tls_data_1_pcap_packet_samples,
             tls_data_1_pcap_packet_samples_count,
-            {4096u, 66u, 4096u, 0u},
+            {4096u, 8u, 4096u, 0u},
             66u,
             PCAPC_REASON_TCP,
             4u,
@@ -444,7 +444,7 @@ int main(void)
             "tls_data_1__packet_4",
             tls_data_1_pcap_packet_samples,
             tls_data_1_pcap_packet_samples_count,
-            {4096u, 66u, 4096u, 0u},
+            {4096u, 8u, 4096u, 0u},
             720u,
             PCAPC_REASON_TCP,
             4u,
@@ -453,23 +453,32 @@ int main(void)
             ETH_HDR_LEN + IPV4_HDR_LEN,
             ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN
         },
-        /* PcapConstrictor-style target lengths for future multi-record TLS policy:
+        /* These are active PcapConstrictor-style expectations.
+         * The TLS scanner preserves all complete TLS records before the first
+         * Application Data record, plus encrypted_snaplen bytes from the
+         * first Application Data record.
+         *
          * - packet 1  TCP SYN                                      66 / 66
          * - packet 4  TLS ClientHello                              720 / 720
          * - packet 6  ServerHello + ChangeCipherSpec + AppData     199 / 2978
          * - packet 9  ChangeCipherSpec + AppData                   68 / 118
          * - packet 14 TLS Application Data                         66 / 145
-         * Current stateless policy is expected to match only packet 14.
-         * Packets 6 and 9 require scanning multiple TLS records in one TCP segment.
+         *
+         * packet #6 AppData starts at offset 191, encrypted_snaplen is 8,
+         * so cap_len is 191 + 8 = 199.
+         * packet #9 AppData starts at offset 60, encrypted_snaplen is 8,
+         * so cap_len is 60 + 8 = 68.
+         * packet #14 AppData starts at offset 58, encrypted_snaplen is 8,
+         * so cap_len is 58 + 8 = 66.
          */
         {
             "real tls packet 6 serverhello ccs appdata",
             "tls_data_1__packet_6",
             tls_data_1_pcap_packet_samples,
             tls_data_1_pcap_packet_samples_count,
-            {4096u, 66u, 4096u, 0u},
-            2978u,
-            PCAPC_REASON_TCP,
+            {4096u, 8u, 4096u, 0u},
+            199u,
+            PCAPC_REASON_TLS_APP_DATA,
             4u,
             IPPROTO_TCP,
             ETH_HDR_LEN + VLAN_TAG_LEN,
@@ -481,9 +490,9 @@ int main(void)
             "tls_data_1__packet_9",
             tls_data_1_pcap_packet_samples,
             tls_data_1_pcap_packet_samples_count,
-            {4096u, 66u, 4096u, 0u},
-            118u,
-            PCAPC_REASON_TCP,
+            {4096u, 8u, 4096u, 0u},
+            68u,
+            PCAPC_REASON_TLS_APP_DATA,
             4u,
             IPPROTO_TCP,
             ETH_HDR_LEN,
@@ -495,7 +504,7 @@ int main(void)
             "tls_data_1__packet_14",
             tls_data_1_pcap_packet_samples,
             tls_data_1_pcap_packet_samples_count,
-            {4096u, 66u, 4096u, 0u},
+            {4096u, 8u, 4096u, 0u},
             66u,
             PCAPC_REASON_TLS_APP_DATA,
             4u,
@@ -520,6 +529,7 @@ int main(void)
     uint8_t ipv4_tcp_tls_handshake[ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN + 5 + 16] = {0};
     uint8_t ipv4_tcp_tls_bad_version[ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN + 5 + 16] = {0};
     uint8_t ipv4_tcp_tls_too_short[ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN + 4] = {0};
+    uint8_t ipv4_tcp_tls_multi_record[ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN + 10 + 6 + 5 + 16] = {0};
     size_t generated_case_index;
     struct pcapc_capture_decision decision;
     struct pcapc_capture_config cfg;
@@ -669,7 +679,7 @@ int main(void)
                    sizeof(tls_appdata_record));
     }
     decision = pcapc_decide_l2_packet(ipv4_tcp_tls_appdata, sizeof(ipv4_tcp_tls_appdata), &cfg);
-    expect_u32(&state, "ipv4 tcp tls appdata cap_len", decision.cap_len, 64u);
+    expect_u32(&state, "ipv4 tcp tls appdata cap_len", decision.cap_len, sizeof(ipv4_tcp_tls_appdata));
     expect_reason(&state, "ipv4 tcp tls appdata reason", decision.reason, PCAPC_REASON_TLS_APP_DATA);
     expect_u8(&state, "ipv4 tcp tls appdata ip_proto", decision.ip_proto, 4u);
     expect_u8(&state, "ipv4 tcp tls appdata l4_proto", decision.l4_proto, IPPROTO_TCP);
@@ -743,6 +753,41 @@ int main(void)
     expect_u16(&state, "ipv4 tcp tls short l3_off", decision.l3_off, ETH_HDR_LEN);
     expect_u16(&state, "ipv4 tcp tls short l4_off", decision.l4_off, ETH_HDR_LEN + IPV4_HDR_LEN);
     expect_u16(&state, "ipv4 tcp tls short payload_off", decision.payload_off, ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN);
+
+    cfg.default_snaplen = 2048u;
+    cfg.encrypted_snaplen = 8u;
+    cfg.max_capture_len = 2048u;
+    cfg.flags = 0u;
+
+    fill_eth_header(ipv4_tcp_tls_multi_record, ETHERTYPE_IPV4);
+    fill_ipv4_header(ipv4_tcp_tls_multi_record, ETH_HDR_LEN, IPPROTO_TCP, 0u);
+    fill_tcp_header(ipv4_tcp_tls_multi_record, ETH_HDR_LEN + IPV4_HDR_LEN);
+    {
+        static const uint8_t tls_multi_record[] = {
+            0x16, 0x03, 0x03, 0x00, 0x05,
+            0x01, 0x02, 0x03, 0x04, 0x05,
+            0x14, 0x03, 0x03, 0x00, 0x01,
+            0x01,
+            0x17, 0x03, 0x03, 0x00, 0x10,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+        };
+        fill_bytes(ipv4_tcp_tls_multi_record,
+                   ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN,
+                   tls_multi_record,
+                   sizeof(tls_multi_record));
+    }
+    decision = pcapc_decide_l2_packet(ipv4_tcp_tls_multi_record, sizeof(ipv4_tcp_tls_multi_record), &cfg);
+    expect_u32(&state,
+               "ipv4 tcp tls multi-record cap_len",
+               decision.cap_len,
+               ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN + 10u + 6u + 8u);
+    expect_reason(&state, "ipv4 tcp tls multi-record reason", decision.reason, PCAPC_REASON_TLS_APP_DATA);
+    expect_u8(&state, "ipv4 tcp tls multi-record ip_proto", decision.ip_proto, 4u);
+    expect_u8(&state, "ipv4 tcp tls multi-record l4_proto", decision.l4_proto, IPPROTO_TCP);
+    expect_u16(&state, "ipv4 tcp tls multi-record l3_off", decision.l3_off, ETH_HDR_LEN);
+    expect_u16(&state, "ipv4 tcp tls multi-record l4_off", decision.l4_off, ETH_HDR_LEN + IPV4_HDR_LEN);
+    expect_u16(&state, "ipv4 tcp tls multi-record payload_off", decision.payload_off, ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN);
 
     for (generated_case_index = 0u;
          generated_case_index < sizeof(generated_cases) / sizeof(generated_cases[0]);
