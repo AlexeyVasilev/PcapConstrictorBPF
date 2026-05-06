@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef PCAP_PACKET_SAMPLE_DEFINED
+#define PCAP_PACKET_SAMPLE_DEFINED
 typedef struct PcapPacketSample {
     const char* name;
     const char* source_path;
@@ -16,6 +18,7 @@ typedef struct PcapPacketSample {
     uint64_t ts_sec;
     uint32_t ts_frac;
 } PcapPacketSample;
+#endif
 
 static const uint8_t packet_1[] = {
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15,

@@ -7,6 +7,7 @@
  * behavior stays defined here in the tests.
  */
 #include "fixtures/generated/sample_packets.inc"
+#include "fixtures/generated/tls_data_1_packets.inc"
 
 enum {
     ETH_HDR_LEN = 14u,
@@ -30,6 +31,8 @@ struct test_state {
 typedef struct GeneratedPolicyCase {
     const char *test_name;
     const char *sample_name;
+    const PcapPacketSample *samples;
+    size_t sample_count;
     struct pcapc_capture_config config;
     uint32_t expected_cap_len;
     uint8_t expected_reason;
@@ -52,13 +55,15 @@ static int string_equals(const char *a, const char *b)
     return *a == *b;
 }
 
-static const PcapPacketSample *find_packet_sample(const char *name)
+static const PcapPacketSample *find_packet_sample_in(const PcapPacketSample *samples,
+                                                     size_t sample_count,
+                                                     const char *name)
 {
     size_t i;
 
-    for (i = 0u; i < pcap_packet_samples_count; i++) {
-        if (string_equals(pcap_packet_samples[i].name, name))
-            return &pcap_packet_samples[i];
+    for (i = 0u; i < sample_count; i++) {
+        if (string_equals(samples[i].name, name))
+            return &samples[i];
     }
 
     return NULL;
@@ -202,6 +207,23 @@ static void expect_generated_u8(struct test_state *state,
     }
 }
 
+static void expect_generated_ptr_not_null(struct test_state *state,
+                                          const char *test_name,
+                                          const char *sample_name,
+                                          const char *field_name,
+                                          const void *actual)
+{
+    state->total++;
+
+    if (actual == NULL) {
+        state->failed++;
+        printf("FAIL %s sample=%s field=%s expected=non-null actual=null\n",
+               test_name,
+               sample_name,
+               field_name);
+    }
+}
+
 static void fill_eth_header(uint8_t *packet, uint16_t ether_type)
 {
     uint32_t i;
@@ -291,12 +313,19 @@ static void run_generated_policy_case(struct test_state *state,
     const PcapPacketSample *sample;
     struct pcapc_capture_decision decision;
 
-    sample = find_packet_sample(test_case->sample_name);
+    sample = find_packet_sample_in(test_case->samples,
+                                   test_case->sample_count,
+                                   test_case->sample_name);
     if (sample == NULL) {
         fail_generated_missing_sample(state, test_case->test_name, test_case->sample_name);
         return;
     }
 
+    expect_generated_ptr_not_null(state,
+                                  test_case->test_name,
+                                  test_case->sample_name,
+                                  "data",
+                                  sample->data);
     expect_generated_u32(state,
                          test_case->test_name,
                          test_case->sample_name,
@@ -309,6 +338,12 @@ static void run_generated_policy_case(struct test_state *state,
                          "captured_len",
                          sample->captured_len,
                          sample->original_len);
+    expect_generated_u32(state,
+                         test_case->test_name,
+                         test_case->sample_name,
+                         "size",
+                         (uint32_t)sample->size,
+                         sample->captured_len);
 
     decision = pcapc_decide_l2_packet(sample->data,
                                       (uint32_t)sample->size,
@@ -365,6 +400,8 @@ int main(void)
         {
             "generated ipv4 tcp",
             "sample_ipv4_tcp",
+            pcap_packet_samples,
+            pcap_packet_samples_count,
             {256u, 256u, 2048u, 0u},
             ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN,
             PCAPC_REASON_TCP,
@@ -377,6 +414,8 @@ int main(void)
         {
             "generated ipv4 udp",
             "sample_ipv4_udp",
+            pcap_packet_samples,
+            pcap_packet_samples_count,
             {256u, 256u, 2048u, 0u},
             ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN,
             PCAPC_REASON_UDP,
@@ -385,6 +424,85 @@ int main(void)
             ETH_HDR_LEN,
             ETH_HDR_LEN + IPV4_HDR_LEN,
             ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN
+        },
+        {
+            "real tls packet 1 syn",
+            "tls_data_1__packet_1",
+            tls_data_1_pcap_packet_samples,
+            tls_data_1_pcap_packet_samples_count,
+            {4096u, 66u, 4096u, 0u},
+            66u,
+            PCAPC_REASON_TCP,
+            4u,
+            IPPROTO_TCP,
+            ETH_HDR_LEN,
+            ETH_HDR_LEN + IPV4_HDR_LEN,
+            66u
+        },
+        {
+            "real tls packet 4 clienthello",
+            "tls_data_1__packet_4",
+            tls_data_1_pcap_packet_samples,
+            tls_data_1_pcap_packet_samples_count,
+            {4096u, 66u, 4096u, 0u},
+            720u,
+            PCAPC_REASON_TCP,
+            4u,
+            IPPROTO_TCP,
+            ETH_HDR_LEN,
+            ETH_HDR_LEN + IPV4_HDR_LEN,
+            ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN
+        },
+        /* PcapConstrictor-style target lengths for future multi-record TLS policy:
+         * - packet 1  TCP SYN                                      66 / 66
+         * - packet 4  TLS ClientHello                              720 / 720
+         * - packet 6  ServerHello + ChangeCipherSpec + AppData     199 / 2978
+         * - packet 9  ChangeCipherSpec + AppData                   68 / 118
+         * - packet 14 TLS Application Data                         66 / 145
+         * Current stateless policy is expected to match only packet 14.
+         * Packets 6 and 9 require scanning multiple TLS records in one TCP segment.
+         */
+        {
+            "real tls packet 6 serverhello ccs appdata",
+            "tls_data_1__packet_6",
+            tls_data_1_pcap_packet_samples,
+            tls_data_1_pcap_packet_samples_count,
+            {4096u, 66u, 4096u, 0u},
+            2978u,
+            PCAPC_REASON_TCP,
+            4u,
+            IPPROTO_TCP,
+            ETH_HDR_LEN + VLAN_TAG_LEN,
+            ETH_HDR_LEN + VLAN_TAG_LEN + IPV4_HDR_LEN,
+            ETH_HDR_LEN + VLAN_TAG_LEN + IPV4_HDR_LEN + TCP_HDR_LEN
+        },
+        {
+            "real tls packet 9 ccs appdata",
+            "tls_data_1__packet_9",
+            tls_data_1_pcap_packet_samples,
+            tls_data_1_pcap_packet_samples_count,
+            {4096u, 66u, 4096u, 0u},
+            118u,
+            PCAPC_REASON_TCP,
+            4u,
+            IPPROTO_TCP,
+            ETH_HDR_LEN,
+            ETH_HDR_LEN + IPV4_HDR_LEN,
+            ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN
+        },
+        {
+            "real tls packet 14 appdata",
+            "tls_data_1__packet_14",
+            tls_data_1_pcap_packet_samples,
+            tls_data_1_pcap_packet_samples_count,
+            {4096u, 66u, 4096u, 0u},
+            66u,
+            PCAPC_REASON_TLS_APP_DATA,
+            4u,
+            IPPROTO_TCP,
+            ETH_HDR_LEN + VLAN_TAG_LEN,
+            ETH_HDR_LEN + VLAN_TAG_LEN + IPV4_HDR_LEN,
+            ETH_HDR_LEN + VLAN_TAG_LEN + IPV4_HDR_LEN + TCP_HDR_LEN
         }
     };
     uint8_t packet_100[100] = {0};
