@@ -10,6 +10,7 @@ add_library(packet_policy src/core/packet_policy.c)
 target_include_directories(packet_policy PUBLIC src/core)
 
 add_executable(policy_tests tests/policy_tests/main.c)
+target_include_directories(policy_tests PRIVATE tests/policy_tests)
 target_link_libraries(policy_tests PRIVATE packet_policy)
 
 enable_testing()

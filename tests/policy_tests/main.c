@@ -2,6 +2,11 @@
 #include <stdio.h>
 
 #include "packet_policy.h"
+/* sample_packets.inc is intentionally generated-style; real corpuses can come
+ * from the external PcapPacketsToArrays utility, while expected analyzer
+ * behavior stays defined here in the tests.
+ */
+#include "fixtures/generated/sample_packets.inc"
 
 enum {
     ETH_HDR_LEN = 14u,
@@ -21,6 +26,43 @@ struct test_state {
     uint32_t total;
     uint32_t failed;
 };
+
+typedef struct GeneratedPolicyCase {
+    const char *test_name;
+    const char *sample_name;
+    struct pcapc_capture_config config;
+    uint32_t expected_cap_len;
+    uint8_t expected_reason;
+    uint8_t expected_ip_proto;
+    uint8_t expected_l4_proto;
+    uint16_t expected_l3_off;
+    uint16_t expected_l4_off;
+    uint16_t expected_payload_off;
+} GeneratedPolicyCase;
+
+static int string_equals(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        if (*a != *b)
+            return 0;
+        a++;
+        b++;
+    }
+
+    return *a == *b;
+}
+
+static const PcapPacketSample *find_packet_sample(const char *name)
+{
+    size_t i;
+
+    for (i = 0u; i < pcap_packet_samples_count; i++) {
+        if (string_equals(pcap_packet_samples[i].name, name))
+            return &pcap_packet_samples[i];
+    }
+
+    return NULL;
+}
 
 static void store_be16(uint8_t *p, uint16_t value)
 {
@@ -86,6 +128,77 @@ static void expect_u8(struct test_state *state,
                name,
                (unsigned)actual,
                (unsigned)expected);
+    }
+}
+
+static void fail_generated_missing_sample(struct test_state *state,
+                                          const char *test_name,
+                                          const char *sample_name)
+{
+    state->total++;
+    state->failed++;
+    printf("FAIL %s sample=%s field=exists expected=1 actual=0\n",
+           test_name,
+           sample_name);
+}
+
+static void expect_generated_u32(struct test_state *state,
+                                 const char *test_name,
+                                 const char *sample_name,
+                                 const char *field_name,
+                                 uint32_t actual,
+                                 uint32_t expected)
+{
+    state->total++;
+
+    if (actual != expected) {
+        state->failed++;
+        printf("FAIL %s sample=%s field=%s expected=%u actual=%u\n",
+               test_name,
+               sample_name,
+               field_name,
+               expected,
+               actual);
+    }
+}
+
+static void expect_generated_u16(struct test_state *state,
+                                 const char *test_name,
+                                 const char *sample_name,
+                                 const char *field_name,
+                                 uint16_t actual,
+                                 uint16_t expected)
+{
+    state->total++;
+
+    if (actual != expected) {
+        state->failed++;
+        printf("FAIL %s sample=%s field=%s expected=%u actual=%u\n",
+               test_name,
+               sample_name,
+               field_name,
+               (unsigned)expected,
+               (unsigned)actual);
+    }
+}
+
+static void expect_generated_u8(struct test_state *state,
+                                const char *test_name,
+                                const char *sample_name,
+                                const char *field_name,
+                                uint8_t actual,
+                                uint8_t expected)
+{
+    state->total++;
+
+    if (actual != expected) {
+        state->failed++;
+        printf("FAIL %s sample=%s field=%s expected=%u actual=%u\n",
+               test_name,
+               sample_name,
+               field_name,
+               (unsigned)expected,
+               (unsigned)actual);
     }
 }
 
@@ -161,9 +274,108 @@ static void fill_udp_header(uint8_t *packet, uint32_t l4_off)
     store_be16(packet + l4_off + 4u, UDP_HDR_LEN);
 }
 
+static void run_generated_policy_case(struct test_state *state,
+                                      const GeneratedPolicyCase *test_case)
+{
+    const PcapPacketSample *sample;
+    struct pcapc_capture_decision decision;
+
+    sample = find_packet_sample(test_case->sample_name);
+    if (sample == NULL) {
+        fail_generated_missing_sample(state, test_case->test_name, test_case->sample_name);
+        return;
+    }
+
+    expect_generated_u32(state,
+                         test_case->test_name,
+                         test_case->sample_name,
+                         "linktype",
+                         sample->linktype,
+                         1u);
+    expect_generated_u32(state,
+                         test_case->test_name,
+                         test_case->sample_name,
+                         "captured_len",
+                         sample->captured_len,
+                         sample->original_len);
+
+    decision = pcapc_decide_l2_packet(sample->data,
+                                      (uint32_t)sample->size,
+                                      &test_case->config);
+
+    expect_generated_u32(state,
+                         test_case->test_name,
+                         test_case->sample_name,
+                         "cap_len",
+                         decision.cap_len,
+                         test_case->expected_cap_len);
+    expect_generated_u8(state,
+                        test_case->test_name,
+                        test_case->sample_name,
+                        "reason",
+                        decision.reason,
+                        test_case->expected_reason);
+    expect_generated_u8(state,
+                        test_case->test_name,
+                        test_case->sample_name,
+                        "ip_proto",
+                        decision.ip_proto,
+                        test_case->expected_ip_proto);
+    expect_generated_u8(state,
+                        test_case->test_name,
+                        test_case->sample_name,
+                        "l4_proto",
+                        decision.l4_proto,
+                        test_case->expected_l4_proto);
+    expect_generated_u16(state,
+                         test_case->test_name,
+                         test_case->sample_name,
+                         "l3_off",
+                         decision.l3_off,
+                         test_case->expected_l3_off);
+    expect_generated_u16(state,
+                         test_case->test_name,
+                         test_case->sample_name,
+                         "l4_off",
+                         decision.l4_off,
+                         test_case->expected_l4_off);
+    expect_generated_u16(state,
+                         test_case->test_name,
+                         test_case->sample_name,
+                         "payload_off",
+                         decision.payload_off,
+                         test_case->expected_payload_off);
+}
+
 int main(void)
 {
     struct test_state state = {0};
+    static const GeneratedPolicyCase generated_cases[] = {
+        {
+            "generated ipv4 tcp",
+            "sample_ipv4_tcp",
+            {256u, 256u, 2048u, 0u},
+            ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN,
+            PCAPC_REASON_TCP,
+            4u,
+            IPPROTO_TCP,
+            ETH_HDR_LEN,
+            ETH_HDR_LEN + IPV4_HDR_LEN,
+            ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN
+        },
+        {
+            "generated ipv4 udp",
+            "sample_ipv4_udp",
+            {256u, 256u, 2048u, 0u},
+            ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN,
+            PCAPC_REASON_UDP,
+            4u,
+            IPPROTO_UDP,
+            ETH_HDR_LEN,
+            ETH_HDR_LEN + IPV4_HDR_LEN,
+            ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN
+        }
+    };
     uint8_t packet_100[100] = {0};
     uint8_t packet_1500[1500] = {0};
     uint8_t packet_4096[4096] = {0};
@@ -175,6 +387,7 @@ int main(void)
     uint8_t truncated_eth[10] = {0};
     uint8_t truncated_ipv4[ETH_HDR_LEN + 10] = {0};
     uint8_t ipv4_frag_udp[ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN] = {0};
+    size_t generated_case_index;
     struct pcapc_capture_decision decision;
     struct pcapc_capture_config cfg;
 
@@ -302,6 +515,12 @@ int main(void)
     expect_u16(&state, "ipv4 frag udp l3_off", decision.l3_off, ETH_HDR_LEN);
     expect_u16(&state, "ipv4 frag udp l4_off", decision.l4_off, 0u);
     expect_u16(&state, "ipv4 frag udp payload_off", decision.payload_off, 0u);
+
+    for (generated_case_index = 0u;
+         generated_case_index < sizeof(generated_cases) / sizeof(generated_cases[0]);
+         generated_case_index++) {
+        run_generated_policy_case(&state, &generated_cases[generated_case_index]);
+    }
 
     if (state.failed != 0u) {
         printf("FAIL %u/%u\n", state.failed, state.total);
