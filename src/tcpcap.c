@@ -14,8 +14,12 @@
 #include "shared/packet_policy_types.h"
 #include "tcpcap.skel.h"
 
-#define SNAPLEN 256
+/* Compile-time event payload capacity shared with the BPF event layout. */
 #define MAX_CAPTURE_LEN 4096
+/* Default pcap global snaplen. Runtime capture policy cannot exceed the
+ * compile-time event payload capacity above.
+ */
+#define SNAPLEN MAX_CAPTURE_LEN
 
 #define DIR_INGRESS 0
 #define DIR_EGRESS  1
@@ -175,9 +179,9 @@ int main(int argc, char **argv)
     unsigned int ifindex;
     uint32_t config_key = 0;
     struct pcapc_capture_config capture_config = {
-        256u,
+        4096u,
         8u,
-        256u,
+        4096u,
         0u
     };
     int ingress_fd;
@@ -295,7 +299,9 @@ int main(int argc, char **argv)
 
     printf("Capturing TC ingress+egress on %s ifindex=%u into %s\n",
            argv[1], ifindex, argv[2]);
-    printf("SNAPLEN=%d. Press Ctrl+C to stop.\n", SNAPLEN);
+    printf("SNAPLEN=%d. BPF currently uses only the default snaplen policy; "
+           "protocol-aware TLS/QUIC policy remains host-only. Press Ctrl+C to stop.\n",
+           SNAPLEN);
 
     while (!exiting) {
         err = ring_buffer__poll(rb, 100);
