@@ -4,8 +4,10 @@
 
 #ifdef PCAPC_BPF
 #define PCAPC_INLINE static __always_inline
+#define PCAPC_TLS_SCAN_ENABLED 0
 #else
 #define PCAPC_INLINE static inline
+#define PCAPC_TLS_SCAN_ENABLED 1
 #endif
 
 enum {
@@ -77,16 +79,17 @@ pcapc_find_tls_application_data_record_start(const pcapc_u8 *data,
     off = payload_off;
 
     for (record_index = 0u; record_index < PCAPC_TLS_MAX_RECORDS_SCANNED; record_index++) {
+        pcapc_u32 remaining;
         pcapc_u8 content_type;
         pcapc_u8 major;
         pcapc_u8 minor;
         pcapc_u16 record_len;
-        pcapc_u32 next_off;
 
         if (off >= len)
             return 0;
 
-        if (len - off < PCAPC_TLS_RECORD_HDR_LEN)
+        remaining = len - off;
+        if (remaining < PCAPC_TLS_RECORD_HDR_LEN)
             return 0;
 
         content_type = data[off];
@@ -111,11 +114,10 @@ pcapc_find_tls_application_data_record_start(const pcapc_u8 *data,
             return 0;
         }
 
-        next_off = off + PCAPC_TLS_RECORD_HDR_LEN + (pcapc_u32)record_len;
-        if (next_off > len)
+        if ((pcapc_u32)record_len > remaining - PCAPC_TLS_RECORD_HDR_LEN)
             return 0;
 
-        off = next_off;
+        off += PCAPC_TLS_RECORD_HDR_LEN + (pcapc_u32)record_len;
     }
 
     return 0;
@@ -231,6 +233,7 @@ pcapc_decide_l2_packet_impl(const pcapc_u8 *data,
             if (payload_off < len) {
                 pcapc_u32 app_data_off;
 
+#if PCAPC_TLS_SCAN_ENABLED
                 if (pcapc_find_tls_application_data_record_start(data, len, payload_off, &app_data_off)) {
                     pcapc_u32 tls_cap_len;
 
@@ -243,6 +246,15 @@ pcapc_decide_l2_packet_impl(const pcapc_u8 *data,
                     tls_cap_len = pcapc_min_u32(tls_cap_len, active_cfg->max_capture_len);
                     decision.cap_len = tls_cap_len;
                 }
+#else
+                (void)app_data_off;
+                /* TODO: Re-enable shared TLS record scanning for BPF once the
+                 * verifier can be satisfied by a sufficiently simple bounded
+                 * formulation. For now, keep the conservative TCP/default
+                 * behavior in kernel space and leave TLS policy active only in
+                 * the portable host implementation.
+                 */
+#endif
             }
             return decision;
         }
@@ -317,6 +329,7 @@ pcapc_decide_l2_packet_impl(const pcapc_u8 *data,
             if (payload_off < len) {
                 pcapc_u32 app_data_off;
 
+#if PCAPC_TLS_SCAN_ENABLED
                 if (pcapc_find_tls_application_data_record_start(data, len, payload_off, &app_data_off)) {
                     pcapc_u32 tls_cap_len;
 
@@ -329,6 +342,15 @@ pcapc_decide_l2_packet_impl(const pcapc_u8 *data,
                     tls_cap_len = pcapc_min_u32(tls_cap_len, active_cfg->max_capture_len);
                     decision.cap_len = tls_cap_len;
                 }
+#else
+                (void)app_data_off;
+                /* TODO: Re-enable shared TLS record scanning for BPF once the
+                 * verifier can be satisfied by a sufficiently simple bounded
+                 * formulation. For now, keep the conservative TCP/default
+                 * behavior in kernel space and leave TLS policy active only in
+                 * the portable host implementation.
+                 */
+#endif
             }
             return decision;
         }
@@ -350,4 +372,5 @@ pcapc_decide_l2_packet_impl(const pcapc_u8 *data,
     return decision;
 }
 
+#undef PCAPC_TLS_SCAN_ENABLED
 #undef PCAPC_INLINE

@@ -1,8 +1,9 @@
-#include "vmlinux.h"
+#include "shared/bpf_compat_min.h"
 #include <bpf/bpf_helpers.h>
 
 #define PCAPC_BPF
 #include "shared/packet_policy_types.h"
+#include "shared/packet_policy_impl.h"
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -12,6 +13,7 @@ char LICENSE[] SEC("license") = "GPL";
 #define DIR_EGRESS  1
 
 #define MAX_CAPTURE_LEN 4096
+#define COPY_WINDOW_LEN 256
 
 struct event {
     __u64 ts_ns;
@@ -67,20 +69,54 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
 {
     struct event *e;
     struct pcapc_capture_config cfg;
+    __u32 pkt_len;
     __u32 cap_len;
+    __u32 copy_len;
 
     cfg = load_capture_config();
-    cap_len = min_u32(skb->len, cfg.default_snaplen);
-    cap_len = min_u32(cap_len, cfg.max_capture_len);
-    cap_len = min_u32(cap_len, MAX_CAPTURE_LEN);
+    pkt_len = skb->len;
+    cap_len = pkt_len;
+    if (cap_len > cfg.default_snaplen)
+        cap_len = cfg.default_snaplen;
+    if (cap_len > cfg.max_capture_len)
+        cap_len = cfg.max_capture_len;
+    if (cap_len > MAX_CAPTURE_LEN)
+        cap_len = MAX_CAPTURE_LEN;
+
+    if (pkt_len == 0)
+        copy_len = 0;
+    else if (pkt_len < COPY_WINDOW_LEN)
+        copy_len = pkt_len;
+    else
+        copy_len = COPY_WINDOW_LEN;
+
+    if (cap_len > copy_len)
+        cap_len = copy_len;
 
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e)
         return TC_ACT_OK;
 
+    /* TODO: Re-enable shared policy parsing in BPF once the generic parser
+     * can be expressed in a verifier-stable way on this target kernel.
+     * For now, keep the runtime-configurable default capture policy and
+     * conservative metadata defaults so the recorder remains loadable.
+     */
+    if (copy_len != 0) {
+        if (copy_len < COPY_WINDOW_LEN) {
+            if (bpf_skb_load_bytes(skb, 0, e->data, copy_len) < 0) {
+                bpf_ringbuf_discard(e, 0);
+                return TC_ACT_OK;
+            }
+        } else if (bpf_skb_load_bytes(skb, 0, e->data, COPY_WINDOW_LEN) < 0) {
+            bpf_ringbuf_discard(e, 0);
+            return TC_ACT_OK;
+        }
+    }
+
     e->ts_ns = bpf_ktime_get_ns();
     e->ifindex = skb->ifindex;
-    e->pkt_len = skb->len;
+    e->pkt_len = pkt_len;
     e->cap_len = cap_len;
     e->l3_off = 0;
     e->l4_off = 0;
@@ -89,11 +125,6 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
     e->ip_proto = 0;
     e->l4_proto = 0;
     e->reason = PCAPC_REASON_DEFAULT;
-
-    if (cap_len != 0 && bpf_skb_load_bytes(skb, 0, e->data, cap_len) < 0) {
-        bpf_ringbuf_discard(e, 0);
-        return TC_ACT_OK;
-    }
 
     bpf_ringbuf_submit(e, 0);
     return TC_ACT_OK;
