@@ -1,5 +1,10 @@
 #pragma once
 
+/* Minimal BPF compatibility shim for this build path. It provides just the
+ * scalar/map/context pieces this translation unit needs and is not a full
+ * replacement for generated vmlinux.h or Linux UAPI headers.
+ */
+
 typedef unsigned char __u8;
 typedef signed char __s8;
 typedef unsigned short __u16;

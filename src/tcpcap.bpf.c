@@ -3,7 +3,6 @@
 
 #define PCAPC_BPF
 #include "shared/packet_policy_types.h"
-#include "shared/packet_policy_impl.h"
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -12,7 +11,9 @@ char LICENSE[] SEC("license") = "GPL";
 #define DIR_INGRESS 0
 #define DIR_EGRESS  1
 
+/* Future compile-time event payload capacity. */
 #define MAX_CAPTURE_LEN 4096
+/* Temporary verifier-safe copy limit for the current BPF path. */
 #define COPY_WINDOW_LEN 256
 
 struct event {
@@ -82,6 +83,8 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
         cap_len = cfg.max_capture_len;
     if (cap_len > MAX_CAPTURE_LEN)
         cap_len = MAX_CAPTURE_LEN;
+    if (cap_len > COPY_WINDOW_LEN)
+        cap_len = COPY_WINDOW_LEN;
 
     if (pkt_len == 0)
         copy_len = 0;
@@ -97,10 +100,10 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
     if (!e)
         return TC_ACT_OK;
 
-    /* TODO: Re-enable shared policy parsing in BPF once the generic parser
-     * can be expressed in a verifier-stable way on this target kernel.
-     * For now, keep the runtime-configurable default capture policy and
-     * conservative metadata defaults so the recorder remains loadable.
+    /* BPF currently uses only the runtime-configurable default snaplen
+     * policy. Shared L2/L3/L4 parsing and TLS-aware policy remain host-only
+     * until the BPF bounds handling is refactored into a verifier-stable
+     * form on this target kernel. Keep conservative metadata defaults here.
      */
     if (copy_len != 0) {
         if (copy_len < COPY_WINDOW_LEN) {
