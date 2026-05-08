@@ -13,6 +13,10 @@ typedef uint32_t pcapc_u32;
 typedef uint64_t pcapc_u64;
 #endif
 
+#define PCAPC_QUIC_MAX_CID_LEN 20
+#define PCAPC_QUIC_CID_SOURCE_DCID 0x01u
+#define PCAPC_QUIC_CID_SOURCE_SCID 0x02u
+
 enum pcapc_capture_reason {
     PCAPC_REASON_DEFAULT = 0,
     PCAPC_REASON_PARSE_ERROR,
@@ -68,4 +72,17 @@ struct pcapc_capture_decision {
     pcapc_u8 l4_proto;
     pcapc_u8 reason;
     pcapc_u8 flags;
+};
+
+struct pcapc_quic_cid_key {
+    pcapc_u8 len;
+    pcapc_u8 bytes[PCAPC_QUIC_MAX_CID_LEN];
+};
+
+struct pcapc_quic_cid_value {
+    pcapc_u64 first_seen_ns;
+    pcapc_u64 last_seen_ns;
+    pcapc_u64 packets;
+    pcapc_u32 ifindex;
+    pcapc_u8 source_flags;
 };

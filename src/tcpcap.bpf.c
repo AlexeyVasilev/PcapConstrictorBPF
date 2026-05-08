@@ -29,11 +29,8 @@ char LICENSE[] SEC("license") = "GPL";
 #define BPF_MAP_TYPE_LRU_HASH 9
 #endif
 
-#define QUIC_MAX_CID_LEN 20
 #define QUIC_LONG_HEADER_BIT 0x80
 #define QUIC_FIXED_BIT 0x40
-#define QUIC_CID_SOURCE_DCID 0x01
-#define QUIC_CID_SOURCE_SCID 0x02
 #define QUIC_CID_STORE_LEARNED 1
 #define QUIC_CID_STORE_UPDATED 2
 #define QUIC_CID_STORE_FAILED 3
@@ -83,24 +80,11 @@ struct {
     __type(value, __u64);
 } capture_stats SEC(".maps");
 
-struct quic_cid_key {
-    __u8 len;
-    __u8 bytes[QUIC_MAX_CID_LEN];
-};
-
-struct quic_cid_value {
-    __u64 first_seen_ns;
-    __u64 last_seen_ns;
-    __u64 packets;
-    __u32 ifindex;
-    __u8 source_flags;
-};
-
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 4096);
-    __type(key, struct quic_cid_key);
-    __type(value, struct quic_cid_value);
+    __type(key, struct pcapc_quic_cid_key);
+    __type(value, struct pcapc_quic_cid_value);
 } quic_cids SEC(".maps");
 
 struct bpf_packet_meta {
@@ -160,7 +144,7 @@ static __always_inline void zero_quic_cid_bytes(__u8 *dst)
     int i;
 
 #pragma unroll
-    for (i = 0; i < QUIC_MAX_CID_LEN; i++)
+    for (i = 0; i < PCAPC_QUIC_MAX_CID_LEN; i++)
         dst[i] = 0;
 }
 
@@ -174,7 +158,7 @@ static __always_inline __u8 load_quic_cid_bytes(struct __sk_buff *skb,
     zero_quic_cid_bytes(dst);
 
 #pragma unroll
-    for (i = 0; i < QUIC_MAX_CID_LEN; i++) {
+    for (i = 0; i < PCAPC_QUIC_MAX_CID_LEN; i++) {
         __u8 byte = 0;
 
         if ((__u8)i >= len)
@@ -192,18 +176,18 @@ static __always_inline __u8 learn_quic_cid(const __u8 *cid_bytes,
                                            __u32 ifindex,
                                            __u8 source_flags)
 {
-    struct quic_cid_key key = {};
-    struct quic_cid_value init_value = {};
-    struct quic_cid_value *existing;
+    struct pcapc_quic_cid_key key = {};
+    struct pcapc_quic_cid_value init_value = {};
+    struct pcapc_quic_cid_value *existing;
     __u64 now;
     int i;
 
-    if (cid_len == 0 || cid_len > QUIC_MAX_CID_LEN)
+    if (cid_len == 0 || cid_len > PCAPC_QUIC_MAX_CID_LEN)
         return 0;
 
     key.len = cid_len;
 #pragma unroll
-    for (i = 0; i < QUIC_MAX_CID_LEN; i++) {
+    for (i = 0; i < PCAPC_QUIC_MAX_CID_LEN; i++) {
         if ((__u8)i >= cid_len)
             continue;
         key.bytes[i] = cid_bytes[i];
@@ -511,8 +495,8 @@ static __always_inline __u8 detect_quic_long_header(struct __sk_buff *skb,
                                                     __u32 ifindex)
 {
     __u8 hdr[6];
-    __u8 dcid[QUIC_MAX_CID_LEN];
-    __u8 scid[QUIC_MAX_CID_LEN];
+    __u8 dcid[PCAPC_QUIC_MAX_CID_LEN];
+    __u8 scid[PCAPC_QUIC_MAX_CID_LEN];
     __u8 scid_len_byte = 0;
     __u8 dcid_len;
     __u8 scid_len;
@@ -548,7 +532,7 @@ static __always_inline __u8 detect_quic_long_header(struct __sk_buff *skb,
         return 0;
 
     dcid_len = hdr[5];
-    if (dcid_len > QUIC_MAX_CID_LEN)
+    if (dcid_len > PCAPC_QUIC_MAX_CID_LEN)
         return 0;
 
     dcid_off = payload_off + sizeof(hdr);
@@ -573,7 +557,7 @@ static __always_inline __u8 detect_quic_long_header(struct __sk_buff *skb,
         return 0;
 
     scid_len = scid_len_byte;
-    if (scid_len > QUIC_MAX_CID_LEN)
+    if (scid_len > PCAPC_QUIC_MAX_CID_LEN)
         return 0;
 
     scid_off = scid_len_off + 1u;
@@ -592,7 +576,7 @@ static __always_inline __u8 detect_quic_long_header(struct __sk_buff *skb,
     stat_inc(STAT_QUIC_LONG);
 
     if (dcid_len != 0u) {
-        store_result = learn_quic_cid(dcid, dcid_len, ifindex, QUIC_CID_SOURCE_DCID);
+        store_result = learn_quic_cid(dcid, dcid_len, ifindex, PCAPC_QUIC_CID_SOURCE_DCID);
         if (store_result == QUIC_CID_STORE_LEARNED)
             stat_inc(STAT_QUIC_CID_LEARNED);
         else if (store_result == QUIC_CID_STORE_UPDATED)
@@ -602,7 +586,7 @@ static __always_inline __u8 detect_quic_long_header(struct __sk_buff *skb,
     }
 
     if (scid_len != 0u) {
-        store_result = learn_quic_cid(scid, scid_len, ifindex, QUIC_CID_SOURCE_SCID);
+        store_result = learn_quic_cid(scid, scid_len, ifindex, PCAPC_QUIC_CID_SOURCE_SCID);
         if (store_result == QUIC_CID_STORE_LEARNED)
             stat_inc(STAT_QUIC_CID_LEARNED);
         else if (store_result == QUIC_CID_STORE_UPDATED)
