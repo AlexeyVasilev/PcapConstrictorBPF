@@ -79,6 +79,7 @@ struct bpf_packet_meta {
     __u8 reason;
     __u16 src_port;
     __u16 dst_port;
+    __u32 payload_len;
 };
 
 static __always_inline __u16 load_be16(const __u8 *p)
@@ -140,11 +141,12 @@ static __always_inline struct pcapc_capture_config load_capture_config(void)
 }
 
 /* This BPF parser is intentionally small and metadata-only. It uses fixed-size
- * bpf_skb_load_bytes() reads for verifier friendliness. TLS/QUIC policy
- * remains disabled in BPF and will be added later in smaller steps.
+ * bpf_skb_load_bytes() reads for verifier friendliness. TLS policy remains
+ * limited to a later single-record AppData check; QUIC policy is still
+ * disabled in BPF and will be added later in smaller steps.
  */
 static __always_inline void parse_packet_headers(struct __sk_buff *skb,
-                                                 __u32 cap_len,
+                                                 __u32 parse_limit,
                                                  struct bpf_packet_meta *meta)
 {
     __u8 eth[ETH_HDR_LEN];
@@ -153,6 +155,7 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
     __u8 l4[TCP_MIN_HDR_LEN];
     __u16 ether_type;
     __u16 frag_field;
+    __u16 ipv4_total_len;
     __u16 l3_off;
     __u16 l4_off;
     __u16 payload_off;
@@ -173,8 +176,9 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
     meta->reason = PCAPC_REASON_DEFAULT;
     meta->src_port = 0;
     meta->dst_port = 0;
+    meta->payload_len = 0;
 
-    if (cap_len < ETH_HDR_LEN) {
+    if (parse_limit < ETH_HDR_LEN) {
         meta->reason = PCAPC_REASON_PARSE_ERROR;
         return;
     }
@@ -188,7 +192,7 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
     l3_off = ETH_HDR_LEN;
 
     if (ether_type == ETH_P_8021Q || ether_type == ETH_P_8021AD) {
-        if ((__u32)l3_off + VLAN_TAG_LEN > cap_len) {
+        if ((__u32)l3_off + VLAN_TAG_LEN > parse_limit) {
             meta->reason = PCAPC_REASON_PARSE_ERROR;
             return;
         }
@@ -201,7 +205,7 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
     }
 
     if (ether_type == ETH_P_8021Q || ether_type == ETH_P_8021AD) {
-        if ((__u32)l3_off + VLAN_TAG_LEN > cap_len) {
+        if ((__u32)l3_off + VLAN_TAG_LEN > parse_limit) {
             meta->reason = PCAPC_REASON_PARSE_ERROR;
             return;
         }
@@ -227,7 +231,7 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
     meta->ip_proto = 4;
     meta->reason = PCAPC_REASON_IPV4;
 
-    if ((__u32)l3_off + IPV4_MIN_HDR_LEN > cap_len) {
+    if ((__u32)l3_off + IPV4_MIN_HDR_LEN > parse_limit) {
         meta->reason = PCAPC_REASON_PARSE_ERROR;
         return;
     }
@@ -241,13 +245,19 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
     if ((version_ihl >> 4) != 4)
         return;
 
+    ipv4_total_len = load_be16(&ipv4[2]);
     ipv4_hdr_len = (version_ihl & 0x0f) * 4u;
     if (ipv4_hdr_len < IPV4_MIN_HDR_LEN) {
         meta->reason = PCAPC_REASON_PARSE_ERROR;
         return;
     }
 
-    if ((__u32)l3_off + ipv4_hdr_len > cap_len) {
+    if ((__u32)l3_off + ipv4_hdr_len > parse_limit) {
+        meta->reason = PCAPC_REASON_PARSE_ERROR;
+        return;
+    }
+
+    if (ipv4_total_len < ipv4_hdr_len) {
         meta->reason = PCAPC_REASON_PARSE_ERROR;
         return;
     }
@@ -261,7 +271,7 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
     meta->l4_off = l4_off;
 
     if (ip_proto == IPPROTO_TCP) {
-        if ((__u32)l4_off + TCP_MIN_HDR_LEN > cap_len) {
+        if ((__u32)l4_off + TCP_MIN_HDR_LEN > parse_limit) {
             meta->reason = PCAPC_REASON_PARSE_ERROR;
             return;
         }
@@ -279,7 +289,12 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
             return;
         }
 
-        if ((__u32)l4_off + tcp_hdr_len > cap_len) {
+        if ((__u32)ipv4_hdr_len + tcp_hdr_len > ipv4_total_len) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+
+        if ((__u32)l4_off + tcp_hdr_len > parse_limit) {
             meta->reason = PCAPC_REASON_PARSE_ERROR;
             return;
         }
@@ -288,7 +303,12 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
         l4_proto = IPPROTO_TCP;
         reason = PCAPC_REASON_TCP;
     } else if (ip_proto == IPPROTO_UDP) {
-        if ((__u32)l4_off + UDP_HDR_LEN > cap_len) {
+        if ((__u32)ipv4_hdr_len + UDP_HDR_LEN > ipv4_total_len) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+
+        if ((__u32)l4_off + UDP_HDR_LEN > parse_limit) {
             meta->reason = PCAPC_REASON_PARSE_ERROR;
             return;
         }
@@ -308,10 +328,64 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
     }
 
     meta->payload_off = payload_off;
+    meta->payload_len = (__u32)ipv4_total_len - (__u32)ipv4_hdr_len - (__u32)(payload_off - l4_off);
     meta->l4_proto = l4_proto;
     meta->reason = reason;
     meta->src_port = src_port;
     meta->dst_port = dst_port;
+}
+
+static __always_inline __u8 detect_simple_tls_app_data(struct __sk_buff *skb,
+                                                       const struct bpf_packet_meta *meta,
+                                                       __u32 parse_limit,
+                                                       __u32 *tls_cap_len,
+                                                       const struct pcapc_capture_config *cfg)
+{
+    __u8 tls[5];
+    __u16 record_len;
+    __u32 cap;
+
+    if (meta->reason != PCAPC_REASON_TCP)
+        return 0;
+    if (meta->l4_proto != IPPROTO_TCP)
+        return 0;
+    if (meta->src_port != 443u && meta->dst_port != 443u)
+        return 0;
+    if (meta->payload_len < sizeof(tls))
+        return 0;
+    if ((__u32)meta->payload_off + sizeof(tls) > parse_limit)
+        return 0;
+
+    if (bpf_skb_load_bytes(skb, meta->payload_off, tls, sizeof(tls)) < 0)
+        return 0;
+
+    if (tls[0] != 0x17u)
+        return 0;
+    if (tls[1] != 0x03u)
+        return 0;
+    if (tls[2] < 0x01u || tls[2] > 0x04u)
+        return 0;
+
+    record_len = load_be16(&tls[3]);
+    if (record_len == 0u || record_len > 18432u)
+        return 0;
+    if (meta->payload_len != (__u32)sizeof(tls) + (__u32)record_len)
+        return 0;
+    if (cfg->encrypted_snaplen > 0xffffffffu - (__u32)meta->payload_off)
+        return 0;
+
+    cap = (__u32)meta->payload_off + cfg->encrypted_snaplen;
+    if (cap > parse_limit)
+        cap = parse_limit;
+    if (cap > MAX_CAPTURE_LEN)
+        cap = MAX_CAPTURE_LEN;
+    if (cap > cfg->max_capture_len)
+        cap = cfg->max_capture_len;
+    if (cap == 0)
+        return 0;
+
+    *tls_cap_len = cap;
+    return 1;
 }
 
 static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
@@ -322,7 +396,9 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
     __u32 default_snaplen;
     __u32 max_capture_len;
     __u32 pkt_len;
+    __u32 parse_limit;
     __u32 cap_len;
+    __u32 tls_cap_len;
 
     cfg = load_capture_config();
     default_snaplen = cfg.default_snaplen;
@@ -338,6 +414,12 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
     if (max_capture_len == 0)
         max_capture_len = 1;
 
+    parse_limit = pkt_len;
+    if (parse_limit > max_capture_len)
+        parse_limit = max_capture_len;
+    if (parse_limit > MAX_CAPTURE_LEN)
+        parse_limit = MAX_CAPTURE_LEN;
+
     cap_len = pkt_len;
     if (cap_len > default_snaplen)
         cap_len = default_snaplen;
@@ -347,6 +429,19 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
         cap_len = MAX_CAPTURE_LEN;
     if (cap_len > COPY_WINDOW_LEN)
         cap_len = COPY_WINDOW_LEN;
+
+    parse_packet_headers(skb, parse_limit, &meta);
+    if (detect_simple_tls_app_data(skb, &meta, parse_limit, &tls_cap_len, &cfg)) {
+        cap_len = tls_cap_len;
+        meta.reason = PCAPC_REASON_TLS_APP_DATA;
+    }
+    stat_inc(stat_key_for_reason(meta.reason));
+    if (meta.l4_proto == IPPROTO_TCP &&
+        (meta.src_port == 443u || meta.dst_port == 443u))
+        stat_inc(STAT_TCP_443);
+    if (meta.l4_proto == IPPROTO_UDP &&
+        (meta.src_port == 443u || meta.dst_port == 443u))
+        stat_inc(STAT_UDP_443);
 
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
@@ -390,15 +485,6 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
             return TC_ACT_OK;
         }
     }
-
-    parse_packet_headers(skb, cap_len, &meta);
-    stat_inc(stat_key_for_reason(meta.reason));
-    if (meta.l4_proto == IPPROTO_TCP &&
-        (meta.src_port == 443u || meta.dst_port == 443u))
-        stat_inc(STAT_TCP_443);
-    if (meta.l4_proto == IPPROTO_UDP &&
-        (meta.src_port == 443u || meta.dst_port == 443u))
-        stat_inc(STAT_UDP_443);
 
     e->ts_ns = bpf_ktime_get_ns();
     e->ifindex = skb->ifindex;
