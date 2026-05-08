@@ -343,6 +343,7 @@ static __always_inline __u8 detect_simple_tls_app_data(struct __sk_buff *skb,
 {
     __u8 tls[5];
     __u16 record_len;
+    __u32 tls_record_total_len;
     __u32 cap;
 
     if (meta->reason != PCAPC_REASON_TCP)
@@ -369,7 +370,15 @@ static __always_inline __u8 detect_simple_tls_app_data(struct __sk_buff *skb,
     record_len = load_be16(&tls[3]);
     if (record_len == 0u || record_len > 18432u)
         return 0;
-    if (meta->payload_len != (__u32)sizeof(tls) + (__u32)record_len)
+
+    /* This helper handles only a single TLS record that starts exactly at the
+     * TCP payload offset. It accepts both complete and partial Application
+     * Data records. If the segment contains trailing bytes after the first TLS
+     * record, it is treated as a later multi-record/trailing-data case and is
+     * left unconstrained for now.
+     */
+    tls_record_total_len = (__u32)sizeof(tls) + (__u32)record_len;
+    if (meta->payload_len > tls_record_total_len)
         return 0;
     if (cfg->encrypted_snaplen > 0xffffffffu - (__u32)meta->payload_off)
         return 0;
