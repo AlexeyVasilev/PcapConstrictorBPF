@@ -25,6 +25,19 @@ char LICENSE[] SEC("license") = "GPL";
 #define TCP_MIN_HDR_LEN 20
 #define UDP_HDR_LEN 8
 
+#ifndef BPF_MAP_TYPE_LRU_HASH
+#define BPF_MAP_TYPE_LRU_HASH 9
+#endif
+
+#define QUIC_MAX_CID_LEN 20
+#define QUIC_LONG_HEADER_BIT 0x80
+#define QUIC_FIXED_BIT 0x40
+#define QUIC_CID_SOURCE_DCID 0x01
+#define QUIC_CID_SOURCE_SCID 0x02
+#define QUIC_CID_STORE_LEARNED 1
+#define QUIC_CID_STORE_UPDATED 2
+#define QUIC_CID_STORE_FAILED 3
+
 /* Compile-time ringbuf event payload capacity. */
 #define MAX_CAPTURE_LEN 4096
 /* Verifier-safe copy limit for the current BPF path. It currently matches the
@@ -69,6 +82,26 @@ struct {
     __type(key, __u32);
     __type(value, __u64);
 } capture_stats SEC(".maps");
+
+struct quic_cid_key {
+    __u8 len;
+    __u8 bytes[QUIC_MAX_CID_LEN];
+};
+
+struct quic_cid_value {
+    __u64 first_seen_ns;
+    __u64 last_seen_ns;
+    __u64 packets;
+    __u32 ifindex;
+    __u8 source_flags;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct quic_cid_key);
+    __type(value, struct quic_cid_value);
+} quic_cids SEC(".maps");
 
 struct bpf_packet_meta {
     __u16 l3_off;
@@ -120,6 +153,81 @@ static __always_inline __u32 stat_key_for_reason(__u8 reason)
     default:
         return STAT_REASON_DEFAULT;
     }
+}
+
+static __always_inline void zero_quic_cid_bytes(__u8 *dst)
+{
+    int i;
+
+#pragma unroll
+    for (i = 0; i < QUIC_MAX_CID_LEN; i++)
+        dst[i] = 0;
+}
+
+static __always_inline __u8 load_quic_cid_bytes(struct __sk_buff *skb,
+                                                __u32 offset,
+                                                __u8 len,
+                                                __u8 *dst)
+{
+    int i;
+
+    zero_quic_cid_bytes(dst);
+
+#pragma unroll
+    for (i = 0; i < QUIC_MAX_CID_LEN; i++) {
+        __u8 byte = 0;
+
+        if ((__u8)i >= len)
+            continue;
+        if (bpf_skb_load_bytes(skb, offset + (__u32)i, &byte, 1) < 0)
+            return 0;
+        dst[i] = byte;
+    }
+
+    return 1;
+}
+
+static __always_inline __u8 learn_quic_cid(const __u8 *cid_bytes,
+                                           __u8 cid_len,
+                                           __u32 ifindex,
+                                           __u8 source_flags)
+{
+    struct quic_cid_key key = {};
+    struct quic_cid_value init_value = {};
+    struct quic_cid_value *existing;
+    __u64 now;
+    int i;
+
+    if (cid_len == 0 || cid_len > QUIC_MAX_CID_LEN)
+        return 0;
+
+    key.len = cid_len;
+#pragma unroll
+    for (i = 0; i < QUIC_MAX_CID_LEN; i++) {
+        if ((__u8)i >= cid_len)
+            continue;
+        key.bytes[i] = cid_bytes[i];
+    }
+
+    now = bpf_ktime_get_ns();
+    existing = bpf_map_lookup_elem(&quic_cids, &key);
+    if (existing) {
+        existing->packets++;
+        existing->last_seen_ns = now;
+        existing->source_flags |= source_flags;
+        return QUIC_CID_STORE_UPDATED;
+    }
+
+    init_value.first_seen_ns = now;
+    init_value.last_seen_ns = now;
+    init_value.packets = 1;
+    init_value.ifindex = ifindex;
+    init_value.source_flags = source_flags;
+
+    if (bpf_map_update_elem(&quic_cids, &key, &init_value, BPF_ANY) != 0)
+        return QUIC_CID_STORE_FAILED;
+
+    return QUIC_CID_STORE_LEARNED;
 }
 
 static __always_inline struct pcapc_capture_config load_capture_config(void)
@@ -397,6 +505,115 @@ static __always_inline __u8 detect_simple_tls_app_data(struct __sk_buff *skb,
     return 1;
 }
 
+static __always_inline __u8 detect_quic_long_header(struct __sk_buff *skb,
+                                                    const struct bpf_packet_meta *meta,
+                                                    __u32 parse_limit,
+                                                    __u32 ifindex)
+{
+    __u8 hdr[6];
+    __u8 dcid[QUIC_MAX_CID_LEN];
+    __u8 scid[QUIC_MAX_CID_LEN];
+    __u8 scid_len_byte = 0;
+    __u8 dcid_len;
+    __u8 scid_len;
+    __u32 payload_off;
+    __u32 payload_end;
+    __u32 dcid_off;
+    __u32 scid_len_off;
+    __u32 scid_off;
+    __u8 store_result;
+
+    if (meta->reason != PCAPC_REASON_UDP)
+        return 0;
+    if (meta->l4_proto != IPPROTO_UDP)
+        return 0;
+    if (meta->src_port != 443u && meta->dst_port != 443u)
+        return 0;
+    if (meta->payload_len < 7u)
+        return 0;
+
+    payload_off = (__u32)meta->payload_off;
+    payload_end = payload_off + meta->payload_len;
+    if (payload_off + sizeof(hdr) > parse_limit)
+        return 0;
+    if (payload_off + sizeof(hdr) > payload_end)
+        return 0;
+
+    if (bpf_skb_load_bytes(skb, payload_off, hdr, sizeof(hdr)) < 0)
+        return 0;
+
+    if ((hdr[0] & QUIC_LONG_HEADER_BIT) == 0u)
+        return 0;
+    if ((hdr[0] & QUIC_FIXED_BIT) == 0u)
+        return 0;
+
+    dcid_len = hdr[5];
+    if (dcid_len > QUIC_MAX_CID_LEN)
+        return 0;
+
+    dcid_off = payload_off + sizeof(hdr);
+    scid_len_off = dcid_off + dcid_len;
+    if (scid_len_off + 1u > payload_end)
+        return 0;
+    if (scid_len_off + 1u > parse_limit)
+        return 0;
+
+    if (dcid_len != 0u) {
+        if (dcid_off + dcid_len > payload_end)
+            return 0;
+        if (dcid_off + dcid_len > parse_limit)
+            return 0;
+        if (!load_quic_cid_bytes(skb, dcid_off, dcid_len, dcid))
+            return 0;
+    } else {
+        zero_quic_cid_bytes(dcid);
+    }
+
+    if (bpf_skb_load_bytes(skb, scid_len_off, &scid_len_byte, 1) < 0)
+        return 0;
+
+    scid_len = scid_len_byte;
+    if (scid_len > QUIC_MAX_CID_LEN)
+        return 0;
+
+    scid_off = scid_len_off + 1u;
+    if (scid_off + scid_len > payload_end)
+        return 0;
+    if (scid_off + scid_len > parse_limit)
+        return 0;
+
+    if (scid_len != 0u) {
+        if (!load_quic_cid_bytes(skb, scid_off, scid_len, scid))
+            return 0;
+    } else {
+        zero_quic_cid_bytes(scid);
+    }
+
+    stat_inc(STAT_QUIC_LONG);
+
+    if (dcid_len != 0u) {
+        store_result = learn_quic_cid(dcid, dcid_len, ifindex, QUIC_CID_SOURCE_DCID);
+        if (store_result == QUIC_CID_STORE_LEARNED)
+            stat_inc(STAT_QUIC_CID_LEARNED);
+        else if (store_result == QUIC_CID_STORE_UPDATED)
+            stat_inc(STAT_QUIC_CID_UPDATE);
+        else if (store_result == QUIC_CID_STORE_FAILED)
+            stat_inc(STAT_QUIC_CID_STORE_FAILED);
+    }
+
+    if (scid_len != 0u) {
+        store_result = learn_quic_cid(scid, scid_len, ifindex, QUIC_CID_SOURCE_SCID);
+        if (store_result == QUIC_CID_STORE_LEARNED)
+            stat_inc(STAT_QUIC_CID_LEARNED);
+        else if (store_result == QUIC_CID_STORE_UPDATED)
+            stat_inc(STAT_QUIC_CID_UPDATE);
+        else if (store_result == QUIC_CID_STORE_FAILED)
+            stat_inc(STAT_QUIC_CID_STORE_FAILED);
+    }
+
+    return 1;
+}
+
 static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
 {
     struct event *e;
@@ -440,7 +657,10 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
         cap_len = COPY_WINDOW_LEN;
 
     parse_packet_headers(skb, parse_limit, &meta);
-    if (detect_simple_tls_app_data(skb, &meta, parse_limit, &tls_cap_len, &cfg)) {
+    if (meta.l4_proto == IPPROTO_UDP) {
+        if (detect_quic_long_header(skb, &meta, parse_limit, skb->ifindex))
+            meta.reason = PCAPC_REASON_QUIC_LONG;
+    } else if (detect_simple_tls_app_data(skb, &meta, parse_limit, &tls_cap_len, &cfg)) {
         cap_len = tls_cap_len;
         meta.reason = PCAPC_REASON_TLS_APP_DATA;
     }

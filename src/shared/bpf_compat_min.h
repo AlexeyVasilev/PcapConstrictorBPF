@@ -26,6 +26,10 @@ typedef __u32 __wsum;
 #define BPF_MAP_TYPE_RINGBUF 27
 #endif
 
+#ifndef BPF_ANY
+#define BPF_ANY 0
+#endif
+
 /* Minimal __sk_buff prefix with the field order and offsets used by this
  * program: len, ifindex, data, and data_end. This keeps the BPF translation
  * unit self-sufficient when generated vmlinux.h does not provide UAPI types
