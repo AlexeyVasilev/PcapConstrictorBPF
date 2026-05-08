@@ -63,6 +63,13 @@ struct {
     __type(value, struct pcapc_capture_config);
 } capture_config SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, STAT_MAX);
+    __type(key, __u32);
+    __type(value, __u64);
+} capture_stats SEC(".maps");
+
 struct bpf_packet_meta {
     __u16 l3_off;
     __u16 l4_off;
@@ -77,6 +84,41 @@ struct bpf_packet_meta {
 static __always_inline __u16 load_be16(const __u8 *p)
 {
     return ((__u16)p[0] << 8) | (__u16)p[1];
+}
+
+static __always_inline void stat_inc(__u32 key)
+{
+    __u64 *value;
+
+    value = bpf_map_lookup_elem(&capture_stats, &key);
+    if (value)
+        __sync_fetch_and_add(value, 1);
+}
+
+static __always_inline __u32 stat_key_for_reason(__u8 reason)
+{
+    switch (reason) {
+    case PCAPC_REASON_DEFAULT:
+        return STAT_REASON_DEFAULT;
+    case PCAPC_REASON_PARSE_ERROR:
+        return STAT_REASON_PARSE_ERROR;
+    case PCAPC_REASON_IPV4:
+        return STAT_REASON_IPV4;
+    case PCAPC_REASON_IPV6:
+        return STAT_REASON_IPV6;
+    case PCAPC_REASON_TCP:
+        return STAT_REASON_TCP;
+    case PCAPC_REASON_UDP:
+        return STAT_REASON_UDP;
+    case PCAPC_REASON_TLS_APP_DATA:
+        return STAT_REASON_TLS_APP_DATA;
+    case PCAPC_REASON_QUIC_LONG:
+        return STAT_REASON_QUIC_LONG;
+    case PCAPC_REASON_QUIC_SHORT_CANDIDATE:
+        return STAT_REASON_QUIC_SHORT_CANDIDATE;
+    default:
+        return STAT_REASON_DEFAULT;
+    }
 }
 
 static __always_inline struct pcapc_capture_config load_capture_config(void)
@@ -286,6 +328,7 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
     default_snaplen = cfg.default_snaplen;
     max_capture_len = cfg.max_capture_len;
     pkt_len = skb->len;
+    stat_inc(STAT_EVENTS_TOTAL);
 
     if (pkt_len == 0)
         return TC_ACT_OK;
@@ -306,8 +349,10 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
         cap_len = COPY_WINDOW_LEN;
 
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e)
+    if (!e) {
+        stat_inc(STAT_RINGBUF_RESERVE_FAILED);
         return TC_ACT_OK;
+    }
 
     /* BPF currently uses only the runtime-configurable default snaplen
      * policy, capped by the compile-time event payload capacity above.
@@ -318,6 +363,7 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
     if (cap_len >= MAX_CAPTURE_LEN) {
         cap_len = MAX_CAPTURE_LEN;
         if (bpf_skb_load_bytes(skb, 0, e->data, MAX_CAPTURE_LEN) < 0) {
+            stat_inc(STAT_COPY_FAILED);
             bpf_ringbuf_discard(e, 0);
             return TC_ACT_OK;
         }
@@ -339,12 +385,20 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
 
         cap_len = bounded_len;
         if (bpf_skb_load_bytes(skb, 0, e->data, bounded_len) < 0) {
+            stat_inc(STAT_COPY_FAILED);
             bpf_ringbuf_discard(e, 0);
             return TC_ACT_OK;
         }
     }
 
     parse_packet_headers(skb, cap_len, &meta);
+    stat_inc(stat_key_for_reason(meta.reason));
+    if (meta.l4_proto == IPPROTO_TCP &&
+        (meta.src_port == 443u || meta.dst_port == 443u))
+        stat_inc(STAT_TCP_443);
+    if (meta.l4_proto == IPPROTO_UDP &&
+        (meta.src_port == 443u || meta.dst_port == 443u))
+        stat_inc(STAT_UDP_443);
 
     e->ts_ns = bpf_ktime_get_ns();
     e->ifindex = skb->ifindex;
@@ -360,6 +414,7 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
     e->l4_proto = meta.l4_proto;
     e->reason = meta.reason;
 
+    stat_inc(STAT_EVENTS_SUBMITTED);
     bpf_ringbuf_submit(e, 0);
     return TC_ACT_OK;
 }

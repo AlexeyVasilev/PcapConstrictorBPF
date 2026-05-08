@@ -25,6 +25,25 @@ enum pcapc_capture_reason {
     PCAPC_REASON_QUIC_SHORT_CANDIDATE
 };
 
+enum pcapc_capture_stat_id {
+    STAT_EVENTS_TOTAL = 0,
+    STAT_EVENTS_SUBMITTED,
+    STAT_RINGBUF_RESERVE_FAILED,
+    STAT_COPY_FAILED,
+    STAT_REASON_DEFAULT,
+    STAT_REASON_PARSE_ERROR,
+    STAT_REASON_IPV4,
+    STAT_REASON_IPV6,
+    STAT_REASON_TCP,
+    STAT_REASON_UDP,
+    STAT_REASON_TLS_APP_DATA,
+    STAT_REASON_QUIC_LONG,
+    STAT_REASON_QUIC_SHORT_CANDIDATE,
+    STAT_TCP_443,
+    STAT_UDP_443,
+    STAT_MAX
+};
+
 struct pcapc_capture_config {
     pcapc_u32 default_snaplen;
     /* For encrypted TLS/QUIC policy decisions, encrypted_snaplen is the

@@ -32,6 +32,24 @@
 
 static volatile sig_atomic_t exiting = 0;
 
+static const char *const stat_names[STAT_MAX] = {
+    [STAT_EVENTS_TOTAL] = "events_total",
+    [STAT_EVENTS_SUBMITTED] = "events_submitted",
+    [STAT_RINGBUF_RESERVE_FAILED] = "ringbuf_reserve_failed",
+    [STAT_COPY_FAILED] = "copy_failed",
+    [STAT_REASON_DEFAULT] = "reason_default",
+    [STAT_REASON_PARSE_ERROR] = "reason_parse_error",
+    [STAT_REASON_IPV4] = "reason_ipv4",
+    [STAT_REASON_IPV6] = "reason_ipv6",
+    [STAT_REASON_TCP] = "reason_tcp",
+    [STAT_REASON_UDP] = "reason_udp",
+    [STAT_REASON_TLS_APP_DATA] = "reason_tls_app_data",
+    [STAT_REASON_QUIC_LONG] = "reason_quic_long",
+    [STAT_REASON_QUIC_SHORT_CANDIDATE] = "reason_quic_short_candidate",
+    [STAT_TCP_443] = "tcp_443",
+    [STAT_UDP_443] = "udp_443",
+};
+
 struct event {
     uint64_t ts_ns;
     uint32_t ifindex;
@@ -121,6 +139,41 @@ static void bpf_timestamp_to_pcap_time(const struct app_state *state,
 
     *ts_sec = (uint32_t)(real_ns / 1000000000ULL);
     *ts_usec = (uint32_t)((real_ns % 1000000000ULL) / 1000ULL);
+}
+
+static void print_capture_stats(const struct tcpcap_bpf *skel)
+{
+    bool printed = false;
+    int map_fd;
+    uint32_t key;
+
+    if (!skel)
+        return;
+
+    map_fd = bpf_map__fd(skel->maps.capture_stats);
+    if (map_fd < 0) {
+        fprintf(stderr, "warning: failed to access capture_stats map\n");
+        return;
+    }
+
+    for (key = 0; key < STAT_MAX; key++) {
+        uint64_t value = 0;
+
+        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
+            continue;
+
+        if (value == 0)
+            continue;
+
+        if (!printed) {
+            fprintf(stderr, "stats:\n");
+            printed = true;
+        }
+
+        fprintf(stderr, "  %s=%llu\n",
+                stat_names[key] ? stat_names[key] : "unknown",
+                (unsigned long long)value);
+    }
 }
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
@@ -322,6 +375,8 @@ int main(int argc, char **argv)
     }
 
 cleanup:
+    print_capture_stats(skel);
+
     if (egress_attached) {
         hook.attach_point = BPF_TC_EGRESS;
         bpf_tc_detach(&hook, &egress_opts);
