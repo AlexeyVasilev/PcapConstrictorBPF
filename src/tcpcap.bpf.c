@@ -11,6 +11,20 @@ char LICENSE[] SEC("license") = "GPL";
 #define DIR_INGRESS 0
 #define DIR_EGRESS  1
 
+#define ETH_P_IP 0x0800
+#define ETH_P_IPV6 0x86DD
+#define ETH_P_8021Q 0x8100
+#define ETH_P_8021AD 0x88A8
+
+#define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
+
+#define ETH_HDR_LEN 14
+#define VLAN_TAG_LEN 4
+#define IPV4_MIN_HDR_LEN 20
+#define TCP_MIN_HDR_LEN 20
+#define UDP_HDR_LEN 8
+
 /* Compile-time ringbuf event payload capacity. */
 #define MAX_CAPTURE_LEN 4096
 /* Verifier-safe copy limit for the current BPF path. It currently matches the
@@ -28,6 +42,8 @@ struct event {
     __u16 l3_off;
     __u16 l4_off;
     __u16 payload_off;
+    __u16 src_port;
+    __u16 dst_port;
     __u8 direction;
     __u8 ip_proto;
     __u8 l4_proto;
@@ -47,9 +63,20 @@ struct {
     __type(value, struct pcapc_capture_config);
 } capture_config SEC(".maps");
 
-static __always_inline __u32 min_u32(__u32 a, __u32 b)
+struct bpf_packet_meta {
+    __u16 l3_off;
+    __u16 l4_off;
+    __u16 payload_off;
+    __u8 ip_proto;
+    __u8 l4_proto;
+    __u8 reason;
+    __u16 src_port;
+    __u16 dst_port;
+};
+
+static __always_inline __u16 load_be16(const __u8 *p)
 {
-    return a < b ? a : b;
+    return ((__u16)p[0] << 8) | (__u16)p[1];
 }
 
 static __always_inline struct pcapc_capture_config load_capture_config(void)
@@ -70,9 +97,185 @@ static __always_inline struct pcapc_capture_config load_capture_config(void)
     return fallback;
 }
 
+/* This BPF parser is intentionally small and metadata-only. It uses fixed-size
+ * bpf_skb_load_bytes() reads for verifier friendliness. TLS/QUIC policy
+ * remains disabled in BPF and will be added later in smaller steps.
+ */
+static __always_inline void parse_packet_headers(struct __sk_buff *skb,
+                                                 __u32 cap_len,
+                                                 struct bpf_packet_meta *meta)
+{
+    __u8 eth[ETH_HDR_LEN];
+    __u8 vlan[VLAN_TAG_LEN];
+    __u8 ipv4[IPV4_MIN_HDR_LEN];
+    __u8 l4[TCP_MIN_HDR_LEN];
+    __u16 ether_type;
+    __u16 frag_field;
+    __u16 l3_off;
+    __u16 l4_off;
+    __u16 payload_off;
+    __u8 ip_proto;
+    __u8 l4_proto;
+    __u8 reason;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8 version_ihl;
+    __u8 ipv4_hdr_len;
+    __u8 tcp_hdr_len;
+
+    meta->l3_off = 0;
+    meta->l4_off = 0;
+    meta->payload_off = 0;
+    meta->ip_proto = 0;
+    meta->l4_proto = 0;
+    meta->reason = PCAPC_REASON_DEFAULT;
+    meta->src_port = 0;
+    meta->dst_port = 0;
+
+    if (cap_len < ETH_HDR_LEN) {
+        meta->reason = PCAPC_REASON_PARSE_ERROR;
+        return;
+    }
+
+    if (bpf_skb_load_bytes(skb, 0, eth, ETH_HDR_LEN) < 0) {
+        meta->reason = PCAPC_REASON_PARSE_ERROR;
+        return;
+    }
+
+    ether_type = load_be16(&eth[12]);
+    l3_off = ETH_HDR_LEN;
+
+    if (ether_type == ETH_P_8021Q || ether_type == ETH_P_8021AD) {
+        if ((__u32)l3_off + VLAN_TAG_LEN > cap_len) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+        if (bpf_skb_load_bytes(skb, l3_off, vlan, VLAN_TAG_LEN) < 0) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+        ether_type = load_be16(&vlan[2]);
+        l3_off += VLAN_TAG_LEN;
+    }
+
+    if (ether_type == ETH_P_8021Q || ether_type == ETH_P_8021AD) {
+        if ((__u32)l3_off + VLAN_TAG_LEN > cap_len) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+        if (bpf_skb_load_bytes(skb, l3_off, vlan, VLAN_TAG_LEN) < 0) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+        ether_type = load_be16(&vlan[2]);
+        l3_off += VLAN_TAG_LEN;
+    }
+
+    meta->l3_off = l3_off;
+
+    if (ether_type == ETH_P_IPV6) {
+        meta->ip_proto = 6;
+        meta->reason = PCAPC_REASON_IPV6;
+        return;
+    }
+
+    if (ether_type != ETH_P_IP)
+        return;
+
+    meta->ip_proto = 4;
+    meta->reason = PCAPC_REASON_IPV4;
+
+    if ((__u32)l3_off + IPV4_MIN_HDR_LEN > cap_len) {
+        meta->reason = PCAPC_REASON_PARSE_ERROR;
+        return;
+    }
+
+    if (bpf_skb_load_bytes(skb, l3_off, ipv4, IPV4_MIN_HDR_LEN) < 0) {
+        meta->reason = PCAPC_REASON_PARSE_ERROR;
+        return;
+    }
+
+    version_ihl = ipv4[0];
+    if ((version_ihl >> 4) != 4)
+        return;
+
+    ipv4_hdr_len = (version_ihl & 0x0f) * 4u;
+    if (ipv4_hdr_len < IPV4_MIN_HDR_LEN) {
+        meta->reason = PCAPC_REASON_PARSE_ERROR;
+        return;
+    }
+
+    if ((__u32)l3_off + ipv4_hdr_len > cap_len) {
+        meta->reason = PCAPC_REASON_PARSE_ERROR;
+        return;
+    }
+
+    frag_field = load_be16(&ipv4[6]);
+    if ((frag_field & 0x2000u) != 0u || (frag_field & 0x1fffu) != 0u)
+        return;
+
+    ip_proto = ipv4[9];
+    l4_off = (__u16)(l3_off + ipv4_hdr_len);
+    meta->l4_off = l4_off;
+
+    if (ip_proto == IPPROTO_TCP) {
+        if ((__u32)l4_off + TCP_MIN_HDR_LEN > cap_len) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+
+        if (bpf_skb_load_bytes(skb, l4_off, l4, TCP_MIN_HDR_LEN) < 0) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+
+        src_port = load_be16(&l4[0]);
+        dst_port = load_be16(&l4[2]);
+        tcp_hdr_len = (l4[12] >> 4) * 4u;
+        if (tcp_hdr_len < TCP_MIN_HDR_LEN) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+
+        if ((__u32)l4_off + tcp_hdr_len > cap_len) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+
+        payload_off = (__u16)(l4_off + tcp_hdr_len);
+        l4_proto = IPPROTO_TCP;
+        reason = PCAPC_REASON_TCP;
+    } else if (ip_proto == IPPROTO_UDP) {
+        if ((__u32)l4_off + UDP_HDR_LEN > cap_len) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+
+        if (bpf_skb_load_bytes(skb, l4_off, l4, UDP_HDR_LEN) < 0) {
+            meta->reason = PCAPC_REASON_PARSE_ERROR;
+            return;
+        }
+
+        src_port = load_be16(&l4[0]);
+        dst_port = load_be16(&l4[2]);
+        payload_off = (__u16)(l4_off + UDP_HDR_LEN);
+        l4_proto = IPPROTO_UDP;
+        reason = PCAPC_REASON_UDP;
+    } else {
+        return;
+    }
+
+    meta->payload_off = payload_off;
+    meta->l4_proto = l4_proto;
+    meta->reason = reason;
+    meta->src_port = src_port;
+    meta->dst_port = dst_port;
+}
+
 static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
 {
     struct event *e;
+    struct bpf_packet_meta meta;
     struct pcapc_capture_config cfg;
     __u32 default_snaplen;
     __u32 max_capture_len;
@@ -141,17 +344,21 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
         }
     }
 
+    parse_packet_headers(skb, cap_len, &meta);
+
     e->ts_ns = bpf_ktime_get_ns();
     e->ifindex = skb->ifindex;
     e->pkt_len = pkt_len;
     e->cap_len = cap_len;
-    e->l3_off = 0;
-    e->l4_off = 0;
-    e->payload_off = 0;
+    e->l3_off = meta.l3_off;
+    e->l4_off = meta.l4_off;
+    e->payload_off = meta.payload_off;
+    e->src_port = meta.src_port;
+    e->dst_port = meta.dst_port;
     e->direction = direction;
-    e->ip_proto = 0;
-    e->l4_proto = 0;
-    e->reason = PCAPC_REASON_DEFAULT;
+    e->ip_proto = meta.ip_proto;
+    e->l4_proto = meta.l4_proto;
+    e->reason = meta.reason;
 
     bpf_ringbuf_submit(e, 0);
     return TC_ACT_OK;

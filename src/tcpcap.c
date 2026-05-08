@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <string.h>
 #include <time.h>
+#include <stddef.h>
 #include <net/if.h>
 
 #include <bpf/libbpf.h>
@@ -39,6 +40,8 @@ struct event {
     uint16_t l3_off;
     uint16_t l4_off;
     uint16_t payload_off;
+    uint16_t src_port;
+    uint16_t dst_port;
     uint8_t direction;
     uint8_t ip_proto;
     uint8_t l4_proto;
@@ -126,8 +129,15 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
     struct app_state *state = ctx;
     const struct event *e = data;
+    const size_t data_off = offsetof(struct event, data);
+
+    if (data_sz < data_off)
+        return 0;
 
     if (e->cap_len > MAX_CAPTURE_LEN)
+        return 0;
+
+    if (data_off + e->cap_len > data_sz)
         return 0;
 
     struct pcap_packet_header ph = {};
