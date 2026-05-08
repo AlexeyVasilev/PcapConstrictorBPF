@@ -362,13 +362,18 @@ int main(int argc, char **argv)
 
     printf("Capturing TC ingress+egress on %s ifindex=%u into %s\n",
            argv[1], ifindex, argv[2]);
-    printf("SNAPLEN=%d. BPF currently uses only the default snaplen policy; "
-           "protocol-aware TLS/QUIC policy remains host-only. Press Ctrl+C to stop.\n",
+    printf("SNAPLEN=%d. BPF policy: default snaplen plus simple TLS AppData "
+           "constriction; multi-record TLS and QUIC remain disabled. "
+           "Press Ctrl+C to stop.\n",
            SNAPLEN);
 
     while (!exiting) {
         err = ring_buffer__poll(rb, 100);
         if (err < 0) {
+            if (err == -EINTR && exiting) {
+                err = 0;
+                break;
+            }
             fprintf(stderr, "ring_buffer__poll error: %d\n", err);
             break;
         }
