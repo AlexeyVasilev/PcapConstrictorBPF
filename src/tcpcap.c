@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include <time.h>
 #include <stddef.h>
 #include <net/if.h>
@@ -103,10 +105,288 @@ struct app_state {
     uint64_t egress_packets;
 };
 
+static void print_usage(const char *argv0)
+{
+    fprintf(stderr,
+            "Usage:\n"
+            "  %s <interface> <output.pcap> [--config <config.ini>]\n",
+            argv0);
+}
+
 static void handle_signal(int sig)
 {
     (void)sig;
     exiting = 1;
+}
+
+static struct pcapc_capture_config default_capture_config(void)
+{
+    struct pcapc_capture_config cfg = {
+        4096u,
+        8u,
+        4096u,
+        0u,
+        32u
+    };
+
+    return cfg;
+}
+
+static char *trim_whitespace(char *s)
+{
+    char *end;
+
+    while (*s != '\0' && isspace((unsigned char)*s))
+        s++;
+
+    if (*s == '\0')
+        return s;
+
+    end = s + strlen(s) - 1;
+    while (end > s && isspace((unsigned char)*end)) {
+        *end = '\0';
+        end--;
+    }
+
+    return s;
+}
+
+static int parse_u32_value(const char *text, uint32_t *value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (text == NULL || *text == '\0')
+        return -1;
+
+    errno = 0;
+    parsed = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || parsed > 0xffffffffUL)
+        return -1;
+
+    *value = (uint32_t)parsed;
+    return 0;
+}
+
+static int parse_bool_value(const char *text, bool *value)
+{
+    if (strcmp(text, "true") == 0) {
+        *value = true;
+        return 0;
+    }
+    if (strcmp(text, "false") == 0) {
+        *value = false;
+        return 0;
+    }
+
+    return -1;
+}
+
+static void normalize_capture_config(const char *source,
+                                     struct pcapc_capture_config *cfg)
+{
+    if (cfg->default_snaplen == 0u) {
+        fprintf(stderr,
+                "warning: %s sets default_snaplen=0; keeping 4096\n",
+                source);
+        cfg->default_snaplen = 4096u;
+    }
+    if (cfg->max_capture_len == 0u) {
+        fprintf(stderr,
+                "warning: %s sets max_capture_len=0; keeping 4096\n",
+                source);
+        cfg->max_capture_len = 4096u;
+    }
+    if (cfg->encrypted_snaplen == 0u) {
+        fprintf(stderr,
+                "warning: %s sets encrypted_snaplen=0; keeping 8\n",
+                source);
+        cfg->encrypted_snaplen = 8u;
+    }
+    if (cfg->quic_short_header_keep_packet_bytes == 0u) {
+        fprintf(stderr,
+                "warning: %s sets quic short keep=0; keeping 32\n",
+                source);
+        cfg->quic_short_header_keep_packet_bytes = 32u;
+    }
+
+    if (cfg->default_snaplen > MAX_CAPTURE_LEN) {
+        fprintf(stderr,
+                "warning: %s default_snaplen=%u exceeds MAX_CAPTURE_LEN=%u; clamping\n",
+                source,
+                cfg->default_snaplen,
+                MAX_CAPTURE_LEN);
+        cfg->default_snaplen = MAX_CAPTURE_LEN;
+    }
+    if (cfg->max_capture_len > MAX_CAPTURE_LEN) {
+        fprintf(stderr,
+                "warning: %s max_capture_len=%u exceeds MAX_CAPTURE_LEN=%u; clamping\n",
+                source,
+                cfg->max_capture_len,
+                MAX_CAPTURE_LEN);
+        cfg->max_capture_len = MAX_CAPTURE_LEN;
+    }
+    if (cfg->default_snaplen > cfg->max_capture_len) {
+        fprintf(stderr,
+                "warning: %s default_snaplen=%u exceeds max_capture_len=%u; clamping default_snaplen\n",
+                source,
+                cfg->default_snaplen,
+                cfg->max_capture_len);
+        cfg->default_snaplen = cfg->max_capture_len;
+    }
+}
+
+static int load_config_file(const char *path, struct pcapc_capture_config *cfg)
+{
+    enum { LINE_BUF_SIZE = 512 };
+    FILE *f;
+    char line[LINE_BUF_SIZE];
+    char section[32] = "";
+    unsigned int line_no = 0;
+
+    f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "failed to open config file '%s': %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *trimmed;
+        char *eq;
+        char *key;
+        char *value;
+
+        line_no++;
+        line[strcspn(line, "\r\n")] = '\0';
+        trimmed = trim_whitespace(line);
+        if (*trimmed == '\0' || *trimmed == '#' || *trimmed == ';')
+            continue;
+
+        if (*trimmed == '[') {
+            size_t len;
+
+            len = strlen(trimmed);
+            if (len < 3 || trimmed[len - 1] != ']') {
+                fprintf(stderr,
+                        "warning: %s:%u invalid section header ignored\n",
+                        path, line_no);
+                continue;
+            }
+
+            trimmed[len - 1] = '\0';
+            trimmed = trim_whitespace(trimmed + 1);
+            if (strlen(trimmed) >= sizeof(section)) {
+                fprintf(stderr,
+                        "warning: %s:%u section name too long ignored\n",
+                        path, line_no);
+                section[0] = '\0';
+                continue;
+            }
+
+            strcpy(section, trimmed);
+            continue;
+        }
+
+        eq = strchr(trimmed, '=');
+        if (!eq) {
+            fprintf(stderr,
+                    "warning: %s:%u invalid line ignored\n",
+                    path, line_no);
+            continue;
+        }
+
+        *eq = '\0';
+        key = trim_whitespace(trimmed);
+        value = trim_whitespace(eq + 1);
+
+        if (strcmp(section, "capture") == 0) {
+            uint32_t parsed;
+
+            if (strcmp(key, "default_snaplen") == 0) {
+                if (parse_u32_value(value, &parsed) != 0 || parsed == 0u) {
+                    fprintf(stderr,
+                            "warning: %s:%u invalid capture.default_snaplen ignored\n",
+                            path, line_no);
+                    continue;
+                }
+                cfg->default_snaplen = parsed;
+            } else if (strcmp(key, "max_capture_len") == 0) {
+                if (parse_u32_value(value, &parsed) != 0 || parsed == 0u) {
+                    fprintf(stderr,
+                            "warning: %s:%u invalid capture.max_capture_len ignored\n",
+                            path, line_no);
+                    continue;
+                }
+                cfg->max_capture_len = parsed;
+            } else {
+                fprintf(stderr,
+                        "warning: %s:%u unknown capture key '%s' ignored\n",
+                        path, line_no, key);
+            }
+        } else if (strcmp(section, "tls") == 0) {
+            uint32_t parsed;
+
+            if (strcmp(key, "encrypted_snaplen") == 0) {
+                if (parse_u32_value(value, &parsed) != 0 || parsed == 0u) {
+                    fprintf(stderr,
+                            "warning: %s:%u invalid tls.encrypted_snaplen ignored\n",
+                            path, line_no);
+                    continue;
+                }
+                cfg->encrypted_snaplen = parsed;
+            } else {
+                fprintf(stderr,
+                        "warning: %s:%u unknown tls key '%s' ignored\n",
+                        path, line_no, key);
+            }
+        } else if (strcmp(section, "quic") == 0) {
+            uint32_t parsed;
+            bool parsed_bool;
+
+            if (strcmp(key, "short_header_keep_packet_bytes") == 0) {
+                if (parse_u32_value(value, &parsed) != 0 || parsed == 0u) {
+                    fprintf(stderr,
+                            "warning: %s:%u invalid quic.short_header_keep_packet_bytes ignored\n",
+                            path, line_no);
+                    continue;
+                }
+                cfg->quic_short_header_keep_packet_bytes = parsed;
+            } else if (strcmp(key, "require_dcid_match") == 0) {
+                if (parse_bool_value(value, &parsed_bool) != 0) {
+                    fprintf(stderr,
+                            "warning: %s:%u invalid quic.require_dcid_match ignored\n",
+                            path, line_no);
+                } else if (!parsed_bool) {
+                    fprintf(stderr,
+                            "warning: %s:%u quic.require_dcid_match is fixed to true in current BPF policy\n",
+                            path, line_no);
+                }
+            } else if (strcmp(key, "allow_short_header_without_known_dcid") == 0) {
+                if (parse_bool_value(value, &parsed_bool) != 0) {
+                    fprintf(stderr,
+                            "warning: %s:%u invalid quic.allow_short_header_without_known_dcid ignored\n",
+                            path, line_no);
+                } else if (parsed_bool) {
+                    fprintf(stderr,
+                            "warning: %s:%u quic.allow_short_header_without_known_dcid is fixed to false in current BPF policy\n",
+                            path, line_no);
+                }
+            } else {
+                fprintf(stderr,
+                        "warning: %s:%u unknown quic key '%s' ignored\n",
+                        path, line_no, key);
+            }
+        } else {
+            fprintf(stderr,
+                    "warning: %s:%u key outside supported section ignored\n",
+                    path, line_no);
+        }
+    }
+
+    fclose(f);
+    normalize_capture_config(path, cfg);
+    return 0;
 }
 
 static uint64_t clock_ns(clockid_t clock_id)
@@ -318,36 +598,50 @@ int main(int argc, char **argv)
 
     struct app_state state = {};
 
+    const char *ifname;
+    const char *output_path;
+    const char *config_path = NULL;
     unsigned int ifindex;
     uint32_t config_key = 0;
-    struct pcapc_capture_config capture_config = {
-        4096u,
-        8u,
-        4096u,
-        0u,
-        32u
-    };
+    struct pcapc_capture_config capture_config = default_capture_config();
     int ingress_fd;
     int egress_fd;
     int err = 0;
 
-    if (argc != 3) {
-        fprintf(stderr, "Usage: sudo %s <interface> <output.pcap>\n", argv[0]);
-        fprintf(stderr, "Example: sudo %s enp0s3 out.pcap\n", argv[0]);
+    if (argc != 3 && argc != 5) {
+        print_usage(argv[0]);
         return 1;
     }
 
-    ifindex = if_nametoindex(argv[1]);
+    ifname = argv[1];
+    output_path = argv[2];
+    if (argc == 5) {
+        if (strcmp(argv[3], "--config") == 0 || strcmp(argv[3], "-c") == 0) {
+            config_path = argv[4];
+        } else {
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (config_path) {
+        if (load_config_file(config_path, &capture_config) != 0)
+            return 1;
+    } else {
+        normalize_capture_config("runtime defaults", &capture_config);
+    }
+
+    ifindex = if_nametoindex(ifname);
     if (!ifindex) {
         fprintf(stderr, "failed to get ifindex for interface '%s': %s\n",
-                argv[1], strerror(errno));
+                ifname, strerror(errno));
         return 1;
     }
 
-    state.pcap_file = fopen(argv[2], "wb");
+    state.pcap_file = fopen(output_path, "wb");
     if (!state.pcap_file) {
         fprintf(stderr, "failed to open output file '%s': %s\n",
-                argv[2], strerror(errno));
+                output_path, strerror(errno));
         return 1;
     }
 
@@ -441,13 +735,17 @@ int main(int argc, char **argv)
     egress_attached = true;
 
     printf("Capturing TC ingress+egress on %s ifindex=%u into %s\n",
-           argv[1], ifindex, argv[2]);
-    printf("SNAPLEN=%d. BPF policy: default snaplen plus simple TLS AppData "
-           "constriction; QUIC Long Header CID/flow learning and short-header "
-           "flow matching/constriction enabled (QUIC short keep=32). "
+           ifname, ifindex, output_path);
+    printf("SNAPLEN=%u, max_capture_len=%u, TLS encrypted_keep=%u, "
+           "QUIC short keep=%u. BPF policy: simple TLS AppData constriction; "
+           "QUIC Long Header CID/flow learning and short-header flow "
+           "matching/constriction enabled. "
            "Multi-record TLS remains disabled. "
            "Press Ctrl+C to stop.\n",
-           SNAPLEN);
+           capture_config.default_snaplen,
+           capture_config.max_capture_len,
+           capture_config.encrypted_snaplen,
+           capture_config.quic_short_header_keep_packet_bytes);
 
     while (!exiting) {
         err = ring_buffer__poll(rb, 100);
