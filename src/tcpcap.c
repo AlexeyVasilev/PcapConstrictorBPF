@@ -49,6 +49,7 @@ static const char *const stat_names[STAT_MAX] = {
     [STAT_TCP_443] = "tcp_443",
     [STAT_UDP_443] = "udp_443",
     [STAT_QUIC_LONG] = "quic_long",
+    [STAT_QUIC_SHORT_CANDIDATE] = "quic_short_candidate",
     [STAT_QUIC_CID_LEARNED] = "quic_cid_learned",
     [STAT_QUIC_CID_UPDATE] = "quic_cid_update",
     [STAT_QUIC_CID_STORE_FAILED] = "quic_cid_store_failed",
@@ -436,8 +437,9 @@ int main(int argc, char **argv)
     printf("Capturing TC ingress+egress on %s ifindex=%u into %s\n",
            argv[1], ifindex, argv[2]);
     printf("SNAPLEN=%d. BPF policy: default snaplen plus simple TLS AppData "
-           "constriction; QUIC Long Header CID learning enabled; "
-           "multi-record TLS and QUIC constriction remain disabled. "
+           "constriction; QUIC Long Header CID learning and short-header "
+           "candidate detection enabled; QUIC constriction remains disabled. "
+           "Multi-record TLS remains disabled. "
            "Press Ctrl+C to stop.\n",
            SNAPLEN);
 

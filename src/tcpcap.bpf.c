@@ -30,6 +30,7 @@ char LICENSE[] SEC("license") = "GPL";
 #endif
 
 #define QUIC_LONG_HEADER_BIT 0x80
+#define QUIC_SHORT_DCID_LEN_INITIAL 8
 #define QUIC_FIXED_BIT 0x40
 #define QUIC_CID_STORE_LEARNED 1
 #define QUIC_CID_STORE_UPDATED 2
@@ -598,6 +599,52 @@ static __always_inline __u8 detect_quic_long_header(struct __sk_buff *skb,
     return 1;
 }
 
+static __always_inline __u8 detect_quic_short_header_len8(struct __sk_buff *skb,
+                                                          const struct bpf_packet_meta *meta,
+                                                          __u32 parse_limit)
+{
+    __u8 short_hdr[1 + QUIC_SHORT_DCID_LEN_INITIAL];
+    struct pcapc_quic_cid_key key = {};
+    struct pcapc_quic_cid_value *value;
+    __u32 payload_off;
+    __u64 now;
+    int i;
+
+    if (meta->l4_proto != IPPROTO_UDP)
+        return 0;
+    if (meta->src_port != 443u && meta->dst_port != 443u)
+        return 0;
+    if (meta->payload_len < sizeof(short_hdr))
+        return 0;
+
+    payload_off = (__u32)meta->payload_off;
+    if (payload_off + sizeof(short_hdr) > parse_limit)
+        return 0;
+
+    if (bpf_skb_load_bytes(skb, payload_off, short_hdr, sizeof(short_hdr)) < 0)
+        return 0;
+
+    if ((short_hdr[0] & QUIC_LONG_HEADER_BIT) != 0u)
+        return 0;
+    if ((short_hdr[0] & QUIC_FIXED_BIT) == 0u)
+        return 0;
+
+    key.len = QUIC_SHORT_DCID_LEN_INITIAL;
+#pragma unroll
+    for (i = 0; i < QUIC_SHORT_DCID_LEN_INITIAL; i++)
+        key.bytes[i] = short_hdr[1 + i];
+
+    value = bpf_map_lookup_elem(&quic_cids, &key);
+    if (!value)
+        return 0;
+
+    now = bpf_ktime_get_ns();
+    value->packets++;
+    value->last_seen_ns = now;
+    stat_inc(STAT_QUIC_SHORT_CANDIDATE);
+    return 1;
+}
+
 static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
 {
     struct event *e;
@@ -644,6 +691,8 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
     if (meta.l4_proto == IPPROTO_UDP) {
         if (detect_quic_long_header(skb, &meta, parse_limit, skb->ifindex))
             meta.reason = PCAPC_REASON_QUIC_LONG;
+        else if (detect_quic_short_header_len8(skb, &meta, parse_limit))
+            meta.reason = PCAPC_REASON_QUIC_SHORT_CANDIDATE;
     } else if (detect_simple_tls_app_data(skb, &meta, parse_limit, &tls_cap_len, &cfg)) {
         cap_len = tls_cap_len;
         meta.reason = PCAPC_REASON_TLS_APP_DATA;
