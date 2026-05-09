@@ -324,7 +324,8 @@ int main(int argc, char **argv)
         4096u,
         8u,
         4096u,
-        0u
+        0u,
+        32u
     };
     int ingress_fd;
     int egress_fd;
@@ -443,7 +444,7 @@ int main(int argc, char **argv)
            argv[1], ifindex, argv[2]);
     printf("SNAPLEN=%d. BPF policy: default snaplen plus simple TLS AppData "
            "constriction; QUIC Long Header CID/flow learning and short-header "
-           "flow matching/constriction enabled. "
+           "flow matching/constriction enabled (QUIC short keep=32). "
            "Multi-record TLS remains disabled. "
            "Press Ctrl+C to stop.\n",
            SNAPLEN);

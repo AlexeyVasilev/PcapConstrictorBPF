@@ -31,7 +31,6 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define QUIC_LONG_HEADER_BIT 0x80
 #define QUIC_FIXED_BIT 0x40
-#define QUIC_SHORT_HEADER_KEEP_PACKET_BYTES 32u
 #define QUIC_REQUIRE_DCID_MATCH 1u
 #define QUIC_ALLOW_SHORT_HEADER_WITHOUT_KNOWN_DCID 0u
 #define QUIC_CID_STORE_LEARNED 1
@@ -364,7 +363,8 @@ static __always_inline struct pcapc_capture_config load_capture_config(void)
         4096u,
         8u,
         4096u,
-        0u
+        0u,
+        32u
     };
 
     cfg = bpf_map_lookup_elem(&capture_config, &key);
@@ -890,7 +890,9 @@ static PCAPC_NOINLINE int capture_packet(struct __sk_buff *skb, __u8 direction)
         else if (detect_quic_short_header_by_flow(skb, &meta, parse_limit,
                                                   &matched_quic_dcid_len)) {
             meta.reason = PCAPC_REASON_QUIC_SHORT_CANDIDATE;
-            keep_from_quic_payload = QUIC_SHORT_HEADER_KEEP_PACKET_BYTES;
+            keep_from_quic_payload = cfg.quic_short_header_keep_packet_bytes;
+            if (keep_from_quic_payload == 0u)
+                keep_from_quic_payload = 32u;
             if (keep_from_quic_payload < 1u + (__u32)matched_quic_dcid_len)
                 keep_from_quic_payload = 1u + (__u32)matched_quic_dcid_len;
             if ((__u32)meta.payload_off <= 0xffffffffu - keep_from_quic_payload) {

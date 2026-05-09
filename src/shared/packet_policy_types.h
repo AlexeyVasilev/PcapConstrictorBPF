@@ -69,6 +69,11 @@ struct pcapc_capture_config {
     pcapc_u32 encrypted_snaplen;
     pcapc_u32 max_capture_len;
     pcapc_u32 flags;
+    /* quic_short_header_keep_packet_bytes is the number of bytes to keep from
+     * the start of a matched QUIC short-header packet payload. The effective
+     * keep length is max(this value, 1 + matched_dcid_len).
+     */
+    pcapc_u32 quic_short_header_keep_packet_bytes;
 };
 
 struct pcapc_capture_decision {

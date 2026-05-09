@@ -58,7 +58,8 @@ pcapc_resolve_capture_config(const struct pcapc_capture_config *cfg)
         256u,
         256u,
         256u,
-        0u
+        0u,
+        32u
     };
 
     return cfg ? cfg : &default_cfg;

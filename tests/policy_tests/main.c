@@ -402,7 +402,7 @@ int main(void)
             "sample_ipv4_tcp",
             pcap_packet_samples,
             pcap_packet_samples_count,
-            {256u, 256u, 2048u, 0u},
+            {256u, 256u, 2048u, 0u, 32u},
             ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN,
             PCAPC_REASON_TCP,
             4u,
@@ -416,7 +416,7 @@ int main(void)
             "sample_ipv4_udp",
             pcap_packet_samples,
             pcap_packet_samples_count,
-            {256u, 256u, 2048u, 0u},
+            {256u, 256u, 2048u, 0u, 32u},
             ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN,
             PCAPC_REASON_UDP,
             4u,
@@ -430,7 +430,7 @@ int main(void)
             "tls_data_1__packet_1",
             tls_data_1_pcap_packet_samples,
             tls_data_1_pcap_packet_samples_count,
-            {4096u, 8u, 4096u, 0u},
+            {4096u, 8u, 4096u, 0u, 32u},
             66u,
             PCAPC_REASON_TCP,
             4u,
@@ -444,7 +444,7 @@ int main(void)
             "tls_data_1__packet_4",
             tls_data_1_pcap_packet_samples,
             tls_data_1_pcap_packet_samples_count,
-            {4096u, 8u, 4096u, 0u},
+            {4096u, 8u, 4096u, 0u, 32u},
             720u,
             PCAPC_REASON_TCP,
             4u,
@@ -476,7 +476,7 @@ int main(void)
             "tls_data_1__packet_6",
             tls_data_1_pcap_packet_samples,
             tls_data_1_pcap_packet_samples_count,
-            {4096u, 8u, 4096u, 0u},
+            {4096u, 8u, 4096u, 0u, 32u},
             199u,
             PCAPC_REASON_TLS_APP_DATA,
             4u,
@@ -490,7 +490,7 @@ int main(void)
             "tls_data_1__packet_9",
             tls_data_1_pcap_packet_samples,
             tls_data_1_pcap_packet_samples_count,
-            {4096u, 8u, 4096u, 0u},
+            {4096u, 8u, 4096u, 0u, 32u},
             68u,
             PCAPC_REASON_TLS_APP_DATA,
             4u,
@@ -504,7 +504,7 @@ int main(void)
             "tls_data_1__packet_14",
             tls_data_1_pcap_packet_samples,
             tls_data_1_pcap_packet_samples_count,
-            {4096u, 8u, 4096u, 0u},
+            {4096u, 8u, 4096u, 0u, 32u},
             66u,
             PCAPC_REASON_TLS_APP_DATA,
             4u,
@@ -532,7 +532,7 @@ int main(void)
     uint8_t ipv4_tcp_tls_multi_record[ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN + 10 + 6 + 5 + 16] = {0};
     size_t generated_case_index;
     struct pcapc_capture_decision decision;
-    struct pcapc_capture_config cfg;
+    struct pcapc_capture_config cfg = {0};
 
     decision = pcapc_decide_l2_packet(packet_100, 0u, NULL);
     expect_u32(&state, "empty packet cap_len", decision.cap_len, 0u);
@@ -542,6 +542,7 @@ int main(void)
     cfg.encrypted_snaplen = 256u;
     cfg.max_capture_len = 256u;
     cfg.flags = 0u;
+    cfg.quic_short_header_keep_packet_bytes = 32u;
     decision = pcapc_decide_l2_packet(packet_100, 100u, &cfg);
     expect_u32(&state, "len 100 snaplen 256", decision.cap_len, 100u);
 
@@ -549,6 +550,7 @@ int main(void)
     cfg.encrypted_snaplen = 256u;
     cfg.max_capture_len = 2048u;
     cfg.flags = 0u;
+    cfg.quic_short_header_keep_packet_bytes = 32u;
     decision = pcapc_decide_l2_packet(packet_1500, 1500u, &cfg);
     expect_u32(&state, "len 1500 snaplen 256 max 2048", decision.cap_len, 256u);
 
@@ -556,6 +558,7 @@ int main(void)
     cfg.encrypted_snaplen = 4096u;
     cfg.max_capture_len = 2048u;
     cfg.flags = 0u;
+    cfg.quic_short_header_keep_packet_bytes = 32u;
     decision = pcapc_decide_l2_packet(packet_1500, 1500u, &cfg);
     expect_u32(&state, "len 1500 snaplen 4096 max 2048", decision.cap_len, 1500u);
 
@@ -563,6 +566,7 @@ int main(void)
     cfg.encrypted_snaplen = 4096u;
     cfg.max_capture_len = 2048u;
     cfg.flags = 0u;
+    cfg.quic_short_header_keep_packet_bytes = 32u;
     decision = pcapc_decide_l2_packet(packet_4096, 4096u, &cfg);
     expect_u32(&state, "len 4096 snaplen 4096 max 2048", decision.cap_len, 2048u);
 
@@ -573,6 +577,7 @@ int main(void)
     cfg.encrypted_snaplen = 256u;
     cfg.max_capture_len = 2048u;
     cfg.flags = 0u;
+    cfg.quic_short_header_keep_packet_bytes = 32u;
 
     fill_eth_header(eth_ipv4_tcp, ETHERTYPE_IPV4);
     fill_ipv4_header(eth_ipv4_tcp, ETH_HDR_LEN, IPPROTO_TCP, 0u);
@@ -663,6 +668,7 @@ int main(void)
     cfg.encrypted_snaplen = 64u;
     cfg.max_capture_len = 2048u;
     cfg.flags = 0u;
+    cfg.quic_short_header_keep_packet_bytes = 32u;
 
     fill_eth_header( ipv4_tcp_tls_appdata, ETHERTYPE_IPV4);
     fill_ipv4_header(ipv4_tcp_tls_appdata, ETH_HDR_LEN, IPPROTO_TCP, 0u);
@@ -758,6 +764,7 @@ int main(void)
     cfg.encrypted_snaplen = 8u;
     cfg.max_capture_len = 2048u;
     cfg.flags = 0u;
+    cfg.quic_short_header_keep_packet_bytes = 32u;
 
     fill_eth_header(ipv4_tcp_tls_multi_record, ETHERTYPE_IPV4);
     fill_ipv4_header(ipv4_tcp_tls_multi_record, ETH_HDR_LEN, IPPROTO_TCP, 0u);
