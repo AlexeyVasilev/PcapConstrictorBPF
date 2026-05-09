@@ -22,6 +22,10 @@ typedef __u32 __wsum;
 #define BPF_MAP_TYPE_ARRAY 2
 #endif
 
+#ifndef BPF_MAP_TYPE_PERCPU_ARRAY
+#define BPF_MAP_TYPE_PERCPU_ARRAY 6
+#endif
+
 #ifndef BPF_MAP_TYPE_RINGBUF
 #define BPF_MAP_TYPE_RINGBUF 27
 #endif

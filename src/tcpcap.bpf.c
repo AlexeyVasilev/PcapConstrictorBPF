@@ -30,11 +30,13 @@ char LICENSE[] SEC("license") = "GPL";
 #endif
 
 #define QUIC_LONG_HEADER_BIT 0x80
-#define QUIC_SHORT_DCID_LEN_INITIAL 8
 #define QUIC_FIXED_BIT 0x40
 #define QUIC_CID_STORE_LEARNED 1
 #define QUIC_CID_STORE_UPDATED 2
 #define QUIC_CID_STORE_FAILED 3
+#define QUIC_FLOW_STORE_LEARNED 1
+#define QUIC_FLOW_STORE_UPDATED 2
+#define QUIC_FLOW_STORE_FAILED 3
 
 /* Compile-time ringbuf event payload capacity. */
 #define MAX_CAPTURE_LEN 4096
@@ -44,6 +46,7 @@ char LICENSE[] SEC("license") = "GPL";
 #define COPY_WINDOW_LEN MAX_CAPTURE_LEN
 
 #define PCAPC_BARRIER_VAR(var) asm volatile("" : "+r"(var))
+#define PCAPC_NOINLINE __attribute__((noinline))
 
 struct event {
     __u64 ts_ns;
@@ -88,6 +91,20 @@ struct {
     __type(value, struct pcapc_quic_cid_value);
 } quic_cids SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct pcapc_quic_flow_key_v4);
+    __type(value, struct pcapc_quic_flow_value);
+} quic_flows SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct pcapc_quic_flow_value);
+} quic_flow_scratch SEC(".maps");
+
 struct bpf_packet_meta {
     __u16 l3_off;
     __u16 l4_off;
@@ -95,6 +112,8 @@ struct bpf_packet_meta {
     __u8 ip_proto;
     __u8 l4_proto;
     __u8 reason;
+    __u32 src_ip;
+    __u32 dst_ip;
     __u16 src_port;
     __u16 dst_port;
     __u32 payload_len;
@@ -103,6 +122,12 @@ struct bpf_packet_meta {
 static __always_inline __u16 load_be16(const __u8 *p)
 {
     return ((__u16)p[0] << 8) | (__u16)p[1];
+}
+
+static __always_inline __u32 load_be32(const __u8 *p)
+{
+    return ((__u32)p[0] << 24) | ((__u32)p[1] << 16) |
+           ((__u32)p[2] << 8) | (__u32)p[3];
 }
 
 static __always_inline void stat_inc(__u32 key)
@@ -149,6 +174,28 @@ static __always_inline void zero_quic_cid_bytes(__u8 *dst)
         dst[i] = 0;
 }
 
+static __always_inline void clear_quic_cid(struct pcapc_quic_cid *cid)
+{
+    cid->len = 0;
+    zero_quic_cid_bytes(cid->bytes);
+}
+
+static __always_inline void set_quic_cid(struct pcapc_quic_cid *cid,
+                                         const __u8 *src,
+                                         __u8 len)
+{
+    int i;
+
+    cid->len = len;
+    zero_quic_cid_bytes(cid->bytes);
+#pragma unroll
+    for (i = 0; i < PCAPC_QUIC_MAX_CID_LEN; i++) {
+        if ((__u8)i >= len)
+            continue;
+        cid->bytes[i] = src[i];
+    }
+}
+
 static __always_inline __u8 load_quic_cid_bytes(struct __sk_buff *skb,
                                                 __u32 offset,
                                                 __u8 len,
@@ -172,10 +219,10 @@ static __always_inline __u8 load_quic_cid_bytes(struct __sk_buff *skb,
     return 1;
 }
 
-static __always_inline __u8 learn_quic_cid(const __u8 *cid_bytes,
-                                           __u8 cid_len,
-                                           __u32 ifindex,
-                                           __u8 source_flags)
+static PCAPC_NOINLINE __u8 learn_quic_cid(const __u8 *cid_bytes,
+                                          __u8 cid_len,
+                                          __u32 ifindex,
+                                          __u8 source_flags)
 {
     struct pcapc_quic_cid_key key = {};
     struct pcapc_quic_cid_value init_value = {};
@@ -215,6 +262,97 @@ static __always_inline __u8 learn_quic_cid(const __u8 *cid_bytes,
     return QUIC_CID_STORE_LEARNED;
 }
 
+static __always_inline void build_quic_flow_key_v4(
+    const struct bpf_packet_meta *meta,
+    struct pcapc_quic_flow_key_v4 *key,
+    __u8 *src_is_a)
+{
+    __u8 src_le_dst;
+
+    src_le_dst = 0;
+    if (meta->src_ip < meta->dst_ip)
+        src_le_dst = 1;
+    else if (meta->src_ip == meta->dst_ip && meta->src_port <= meta->dst_port)
+        src_le_dst = 1;
+
+    if (src_le_dst) {
+        key->ip_a = meta->src_ip;
+        key->port_a = meta->src_port;
+        key->ip_b = meta->dst_ip;
+        key->port_b = meta->dst_port;
+        *src_is_a = 1;
+    } else {
+        key->ip_a = meta->dst_ip;
+        key->port_a = meta->dst_port;
+        key->ip_b = meta->src_ip;
+        key->port_b = meta->src_port;
+        *src_is_a = 0;
+    }
+}
+
+static PCAPC_NOINLINE __u8 learn_quic_flow_state(struct __sk_buff *skb,
+                                                 const struct bpf_packet_meta *meta,
+                                                 const __u8 *scid_bytes,
+                                                 __u8 scid_len)
+{
+    struct pcapc_quic_flow_key_v4 key = {};
+    struct pcapc_quic_flow_value *scratch;
+    struct pcapc_quic_flow_value *existing;
+    const __u32 scratch_key = 0;
+    __u8 src_is_a;
+    __u64 now;
+
+    if (meta->ip_proto != 4u || meta->l4_proto != IPPROTO_UDP)
+        return 0;
+    if (meta->src_port != 443u && meta->dst_port != 443u)
+        return 0;
+
+    build_quic_flow_key_v4(meta, &key, &src_is_a);
+    now = bpf_ktime_get_ns();
+    existing = bpf_map_lookup_elem(&quic_flows, &key);
+    if (existing) {
+        existing->packets++;
+        existing->last_seen_ns = now;
+        if (scid_len != 0u) {
+            if (src_is_a) {
+                set_quic_cid(&existing->endpoint_a_scid, scid_bytes, scid_len);
+                existing->flags |= PCAPC_QUIC_FLOW_HAS_A_SCID;
+            } else {
+                set_quic_cid(&existing->endpoint_b_scid, scid_bytes, scid_len);
+                existing->flags |= PCAPC_QUIC_FLOW_HAS_B_SCID;
+            }
+        }
+        return QUIC_FLOW_STORE_UPDATED;
+    }
+
+    if (scid_len == 0u)
+        return 0;
+
+    scratch = bpf_map_lookup_elem(&quic_flow_scratch, &scratch_key);
+    if (!scratch)
+        return QUIC_FLOW_STORE_FAILED;
+
+    clear_quic_cid(&scratch->endpoint_a_scid);
+    clear_quic_cid(&scratch->endpoint_b_scid);
+    scratch->first_seen_ns = now;
+    scratch->last_seen_ns = now;
+    scratch->packets = 1;
+    scratch->ifindex = skb->ifindex;
+    scratch->flags = 0;
+    if (src_is_a) {
+        set_quic_cid(&scratch->endpoint_a_scid, scid_bytes, scid_len);
+        scratch->flags |= PCAPC_QUIC_FLOW_HAS_A_SCID;
+    } else {
+        set_quic_cid(&scratch->endpoint_b_scid, scid_bytes, scid_len);
+        scratch->flags |= PCAPC_QUIC_FLOW_HAS_B_SCID;
+    }
+
+    if (bpf_map_update_elem(&quic_flows, &key, scratch, BPF_ANY) != 0)
+        return QUIC_FLOW_STORE_FAILED;
+
+    return QUIC_FLOW_STORE_LEARNED;
+}
+
 static __always_inline struct pcapc_capture_config load_capture_config(void)
 {
     const __u32 key = 0;
@@ -235,12 +373,12 @@ static __always_inline struct pcapc_capture_config load_capture_config(void)
 
 /* This BPF parser is intentionally small and metadata-only. It uses fixed-size
  * bpf_skb_load_bytes() reads for verifier friendliness. TLS policy remains
- * limited to a later single-record AppData check; QUIC policy is still
- * disabled in BPF and will be added later in smaller steps.
+ * limited to a single-record AppData check, and QUIC policy currently stops at
+ * Long Header CID learning plus short-header candidate matching.
  */
-static __always_inline void parse_packet_headers(struct __sk_buff *skb,
-                                                 __u32 parse_limit,
-                                                 struct bpf_packet_meta *meta)
+static PCAPC_NOINLINE void parse_packet_headers(struct __sk_buff *skb,
+                                                __u32 parse_limit,
+                                                struct bpf_packet_meta *meta)
 {
     __u8 eth[ETH_HDR_LEN];
     __u8 vlan[VLAN_TAG_LEN];
@@ -267,6 +405,8 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
     meta->ip_proto = 0;
     meta->l4_proto = 0;
     meta->reason = PCAPC_REASON_DEFAULT;
+    meta->src_ip = 0;
+    meta->dst_ip = 0;
     meta->src_port = 0;
     meta->dst_port = 0;
     meta->payload_len = 0;
@@ -355,6 +495,9 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
         return;
     }
 
+    meta->src_ip = load_be32(&ipv4[12]);
+    meta->dst_ip = load_be32(&ipv4[16]);
+
     frag_field = load_be16(&ipv4[6]);
     if ((frag_field & 0x2000u) != 0u || (frag_field & 0x1fffu) != 0u)
         return;
@@ -428,11 +571,11 @@ static __always_inline void parse_packet_headers(struct __sk_buff *skb,
     meta->dst_port = dst_port;
 }
 
-static __always_inline __u8 detect_simple_tls_app_data(struct __sk_buff *skb,
-                                                       const struct bpf_packet_meta *meta,
-                                                       __u32 parse_limit,
-                                                       __u32 *tls_cap_len,
-                                                       const struct pcapc_capture_config *cfg)
+static PCAPC_NOINLINE __u8 detect_simple_tls_app_data(struct __sk_buff *skb,
+                                                      const struct bpf_packet_meta *meta,
+                                                      __u32 parse_limit,
+                                                      __u32 *tls_cap_len,
+                                                      const struct pcapc_capture_config *cfg)
 {
     __u8 tls[5];
     __u16 record_len;
@@ -490,10 +633,10 @@ static __always_inline __u8 detect_simple_tls_app_data(struct __sk_buff *skb,
     return 1;
 }
 
-static __always_inline __u8 detect_quic_long_header(struct __sk_buff *skb,
-                                                    const struct bpf_packet_meta *meta,
-                                                    __u32 parse_limit,
-                                                    __u32 ifindex)
+static PCAPC_NOINLINE __u8 detect_quic_long_header(struct __sk_buff *skb,
+                                                   const struct bpf_packet_meta *meta,
+                                                   __u32 parse_limit,
+                                                   __u32 ifindex)
 {
     __u8 hdr[6];
     __u8 dcid[PCAPC_QUIC_MAX_CID_LEN];
@@ -507,6 +650,7 @@ static __always_inline __u8 detect_quic_long_header(struct __sk_buff *skb,
     __u32 scid_len_off;
     __u32 scid_off;
     __u8 store_result;
+    __u8 flow_result;
 
     if (meta->reason != PCAPC_REASON_UDP)
         return 0;
@@ -596,17 +740,28 @@ static __always_inline __u8 detect_quic_long_header(struct __sk_buff *skb,
             stat_inc(STAT_QUIC_CID_STORE_FAILED);
     }
 
+    flow_result = learn_quic_flow_state(skb, meta, scid, scid_len);
+    if (flow_result == QUIC_FLOW_STORE_LEARNED)
+        stat_inc(STAT_QUIC_FLOW_LEARNED);
+    else if (flow_result == QUIC_FLOW_STORE_UPDATED)
+        stat_inc(STAT_QUIC_FLOW_UPDATE);
+    else if (flow_result == QUIC_FLOW_STORE_FAILED)
+        stat_inc(STAT_QUIC_FLOW_STORE_FAILED);
+
     return 1;
 }
 
-static __always_inline __u8 detect_quic_short_header_len8(struct __sk_buff *skb,
-                                                          const struct bpf_packet_meta *meta,
-                                                          __u32 parse_limit)
+static PCAPC_NOINLINE __u8 detect_quic_short_header_by_flow(struct __sk_buff *skb,
+                                                            const struct bpf_packet_meta *meta,
+                                                            __u32 parse_limit)
 {
-    __u8 short_hdr[1 + QUIC_SHORT_DCID_LEN_INITIAL];
-    struct pcapc_quic_cid_key key = {};
-    struct pcapc_quic_cid_value *value;
+    struct pcapc_quic_flow_key_v4 key = {};
+    struct pcapc_quic_flow_value *value;
+    const struct pcapc_quic_cid *expected;
+    __u8 first_byte = 0;
     __u32 payload_off;
+    __u8 src_is_a;
+    __u8 expected_flag;
     __u64 now;
     int i;
 
@@ -614,38 +769,64 @@ static __always_inline __u8 detect_quic_short_header_len8(struct __sk_buff *skb,
         return 0;
     if (meta->src_port != 443u && meta->dst_port != 443u)
         return 0;
-    if (meta->payload_len < sizeof(short_hdr))
+    if (meta->payload_len < 1u)
         return 0;
 
     payload_off = (__u32)meta->payload_off;
-    if (payload_off + sizeof(short_hdr) > parse_limit)
+    if (payload_off + 1u > parse_limit)
         return 0;
 
-    if (bpf_skb_load_bytes(skb, payload_off, short_hdr, sizeof(short_hdr)) < 0)
+    if (bpf_skb_load_bytes(skb, payload_off, &first_byte, 1) < 0)
         return 0;
 
-    if ((short_hdr[0] & QUIC_LONG_HEADER_BIT) != 0u)
+    if ((first_byte & QUIC_LONG_HEADER_BIT) != 0u)
         return 0;
-    if ((short_hdr[0] & QUIC_FIXED_BIT) == 0u)
+    if ((first_byte & QUIC_FIXED_BIT) == 0u)
         return 0;
 
-    key.len = QUIC_SHORT_DCID_LEN_INITIAL;
-#pragma unroll
-    for (i = 0; i < QUIC_SHORT_DCID_LEN_INITIAL; i++)
-        key.bytes[i] = short_hdr[1 + i];
-
-    value = bpf_map_lookup_elem(&quic_cids, &key);
+    build_quic_flow_key_v4(meta, &key, &src_is_a);
+    value = bpf_map_lookup_elem(&quic_flows, &key);
     if (!value)
         return 0;
+
+    if (src_is_a) {
+        expected = &value->endpoint_b_scid;
+        expected_flag = PCAPC_QUIC_FLOW_HAS_B_SCID;
+    } else {
+        expected = &value->endpoint_a_scid;
+        expected_flag = PCAPC_QUIC_FLOW_HAS_A_SCID;
+    }
+
+    if ((value->flags & expected_flag) == 0u)
+        return 0;
+    if (expected->len == 0u || expected->len > PCAPC_QUIC_MAX_CID_LEN)
+        return 0;
+    if (meta->payload_len < 1u + expected->len)
+        return 0;
+    if (payload_off + 1u + expected->len > parse_limit)
+        return 0;
+
+#pragma unroll
+    for (i = 0; i < PCAPC_QUIC_MAX_CID_LEN; i++) {
+        __u8 cid_byte = 0;
+
+        if ((__u8)i >= expected->len)
+            continue;
+        if (bpf_skb_load_bytes(skb, payload_off + 1u + (__u32)i, &cid_byte, 1) < 0)
+            return 0;
+        if (cid_byte != expected->bytes[i])
+            return 0;
+    }
 
     now = bpf_ktime_get_ns();
     value->packets++;
     value->last_seen_ns = now;
     stat_inc(STAT_QUIC_SHORT_CANDIDATE);
+    stat_inc(STAT_QUIC_SHORT_FLOW_MATCH);
     return 1;
 }
 
-static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
+static PCAPC_NOINLINE int capture_packet(struct __sk_buff *skb, __u8 direction)
 {
     struct event *e;
     struct bpf_packet_meta meta;
@@ -691,7 +872,7 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
     if (meta.l4_proto == IPPROTO_UDP) {
         if (detect_quic_long_header(skb, &meta, parse_limit, skb->ifindex))
             meta.reason = PCAPC_REASON_QUIC_LONG;
-        else if (detect_quic_short_header_len8(skb, &meta, parse_limit))
+        else if (detect_quic_short_header_by_flow(skb, &meta, parse_limit))
             meta.reason = PCAPC_REASON_QUIC_SHORT_CANDIDATE;
     } else if (detect_simple_tls_app_data(skb, &meta, parse_limit, &tls_cap_len, &cfg)) {
         cap_len = tls_cap_len;
@@ -711,11 +892,10 @@ static __always_inline int capture_packet(struct __sk_buff *skb, __u8 direction)
         return TC_ACT_OK;
     }
 
-    /* BPF currently uses only the runtime-configurable default snaplen
-     * policy, capped by the compile-time event payload capacity above.
-     * Shared L2/L3/L4 parsing and protocol-aware TLS/QUIC policy remain
-     * host-only until BPF parsing is added in later steps. Keep
-     * conservative metadata defaults here.
+    /* BPF capture policy stays conservative here: default snaplen for general
+     * traffic, with a later simple TLS AppData override only. QUIC detection
+     * in this path updates metadata and flow state but does not constrain the
+     * copied packet length yet.
      */
     if (cap_len >= MAX_CAPTURE_LEN) {
         cap_len = MAX_CAPTURE_LEN;

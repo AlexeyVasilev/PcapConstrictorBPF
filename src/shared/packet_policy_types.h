@@ -16,6 +16,8 @@ typedef uint64_t pcapc_u64;
 #define PCAPC_QUIC_MAX_CID_LEN 20
 #define PCAPC_QUIC_CID_SOURCE_DCID 0x01u
 #define PCAPC_QUIC_CID_SOURCE_SCID 0x02u
+#define PCAPC_QUIC_FLOW_HAS_A_SCID 0x01u
+#define PCAPC_QUIC_FLOW_HAS_B_SCID 0x02u
 
 enum pcapc_capture_reason {
     PCAPC_REASON_DEFAULT = 0,
@@ -50,6 +52,10 @@ enum pcapc_capture_stat_id {
     STAT_QUIC_CID_LEARNED,
     STAT_QUIC_CID_UPDATE,
     STAT_QUIC_CID_STORE_FAILED,
+    STAT_QUIC_FLOW_LEARNED,
+    STAT_QUIC_FLOW_UPDATE,
+    STAT_QUIC_FLOW_STORE_FAILED,
+    STAT_QUIC_SHORT_FLOW_MATCH,
     STAT_MAX
 };
 
@@ -80,10 +86,32 @@ struct pcapc_quic_cid_key {
     pcapc_u8 bytes[PCAPC_QUIC_MAX_CID_LEN];
 };
 
+struct pcapc_quic_cid {
+    pcapc_u8 len;
+    pcapc_u8 bytes[PCAPC_QUIC_MAX_CID_LEN];
+};
+
 struct pcapc_quic_cid_value {
     pcapc_u64 first_seen_ns;
     pcapc_u64 last_seen_ns;
     pcapc_u64 packets;
     pcapc_u32 ifindex;
     pcapc_u8 source_flags;
+};
+
+struct pcapc_quic_flow_key_v4 {
+    pcapc_u32 ip_a;
+    pcapc_u32 ip_b;
+    pcapc_u16 port_a;
+    pcapc_u16 port_b;
+};
+
+struct pcapc_quic_flow_value {
+    struct pcapc_quic_cid endpoint_a_scid;
+    struct pcapc_quic_cid endpoint_b_scid;
+    pcapc_u64 first_seen_ns;
+    pcapc_u64 last_seen_ns;
+    pcapc_u64 packets;
+    pcapc_u32 ifindex;
+    pcapc_u8 flags;
 };
