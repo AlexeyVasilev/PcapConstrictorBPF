@@ -466,75 +466,6 @@ static void print_capture_stats(const struct tcpcap_bpf *skel)
     }
 }
 
-static const char *quic_cid_flags_to_string(uint8_t source_flags)
-{
-    if ((source_flags & (PCAPC_QUIC_CID_SOURCE_DCID | PCAPC_QUIC_CID_SOURCE_SCID)) ==
-        (PCAPC_QUIC_CID_SOURCE_DCID | PCAPC_QUIC_CID_SOURCE_SCID))
-        return "dcid|scid";
-    if (source_flags & PCAPC_QUIC_CID_SOURCE_DCID)
-        return "dcid";
-    if (source_flags & PCAPC_QUIC_CID_SOURCE_SCID)
-        return "scid";
-    return "unknown";
-}
-
-static void print_quic_cids(const struct tcpcap_bpf *skel)
-{
-    enum { QUIC_CID_PRINT_LIMIT = 64 };
-
-    struct pcapc_quic_cid_key key = {};
-    struct pcapc_quic_cid_key next_key = {};
-    bool have_key = false;
-    bool printed = false;
-    int map_fd;
-    int shown = 0;
-
-    if (!skel)
-        return;
-
-    map_fd = bpf_map__fd(skel->maps.quic_cids);
-    if (map_fd < 0) {
-        fprintf(stderr, "warning: failed to access quic_cids map\n");
-        return;
-    }
-
-    while (bpf_map_get_next_key(map_fd, have_key ? &key : NULL, &next_key) == 0) {
-        struct pcapc_quic_cid_value value = {};
-        int more_entries = 0;
-        int i;
-
-        key = next_key;
-        have_key = true;
-
-        if (key.len == 0 || key.len > PCAPC_QUIC_MAX_CID_LEN)
-            continue;
-
-        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
-            continue;
-
-        if (!printed) {
-            fprintf(stderr, "learned_quic_cids:\n");
-            printed = true;
-        }
-
-        fprintf(stderr, "  len=%u cid=", key.len);
-        for (i = 0; i < key.len; i++)
-            fprintf(stderr, "%02x", key.bytes[i]);
-        fprintf(stderr, " packets=%llu flags=%s ifindex=%u\n",
-                (unsigned long long)value.packets,
-                quic_cid_flags_to_string(value.source_flags),
-                value.ifindex);
-
-        shown++;
-        if (shown >= QUIC_CID_PRINT_LIMIT) {
-            more_entries = (bpf_map_get_next_key(map_fd, &key, &next_key) == 0);
-            if (more_entries)
-                fprintf(stderr, "  ... truncated, shown=%d\n", shown);
-            break;
-        }
-    }
-}
-
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
     (void)data_sz;
@@ -761,7 +692,6 @@ int main(int argc, char **argv)
 
 cleanup:
     print_capture_stats(skel);
-    print_quic_cids(skel);
 
     if (egress_attached) {
         hook.attach_point = BPF_TC_EGRESS;
