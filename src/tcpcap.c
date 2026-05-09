@@ -10,6 +10,8 @@
 #include <time.h>
 #include <stddef.h>
 #include <net/if.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -109,7 +111,9 @@ static void print_usage(const char *argv0)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s <interface> <output.pcap> [--config <config.ini>]\n",
+            "  %s <interface> <output.pcap> [--config <config.ini>]\n"
+            "  %s <interface> --cleanup\n",
+            argv0,
             argv0);
 }
 
@@ -414,6 +418,139 @@ static int write_pcap_global_header(FILE *f)
     return fwrite(&hdr, sizeof(hdr), 1, f) == 1 ? 0 : -1;
 }
 
+static void print_permission_hint(const char *action, int err)
+{
+    if (err == -EPERM || err == -EACCES)
+        fprintf(stderr, "%s requires elevated privileges; try running with sudo\n", action);
+}
+
+static int run_tc_command_silent(const char *const argv[])
+{
+    pid_t pid;
+    int status;
+    int devnull_fd;
+
+    pid = fork();
+    if (pid < 0)
+        return -1;
+
+    if (pid == 0) {
+        devnull_fd = open("/dev/null", O_WRONLY);
+        if (devnull_fd >= 0) {
+            dup2(devnull_fd, STDOUT_FILENO);
+            dup2(devnull_fd, STDERR_FILENO);
+            if (devnull_fd > STDERR_FILENO)
+                close(devnull_fd);
+        }
+
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+
+    if (waitpid(pid, &status, 0) < 0)
+        return -1;
+
+    if (!WIFEXITED(status))
+        return -1;
+
+    return WEXITSTATUS(status);
+}
+
+static int tc_qdisc_has_clsact(const char *ifname)
+{
+    const char *const argv[] = { "tc", "qdisc", "show", "dev", ifname, NULL };
+    char buffer[4096];
+    ssize_t total = 0;
+    int pipefd[2];
+    pid_t pid;
+    int status;
+    int devnull_fd;
+
+    if (pipe(pipefd) != 0)
+        return -1;
+
+    pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+
+        devnull_fd = open("/dev/null", O_WRONLY);
+        if (devnull_fd >= 0) {
+            dup2(devnull_fd, STDERR_FILENO);
+            if (devnull_fd > STDERR_FILENO)
+                close(devnull_fd);
+        }
+
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    while (total < (ssize_t)(sizeof(buffer) - 1)) {
+        ssize_t n = read(pipefd[0], buffer + total, sizeof(buffer) - 1 - (size_t)total);
+
+        if (n <= 0)
+            break;
+        total += n;
+    }
+    close(pipefd[0]);
+
+    if (waitpid(pid, &status, 0) < 0)
+        return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return -1;
+
+    buffer[total] = '\0';
+    return strstr(buffer, "qdisc clsact ") != NULL ? 1 : 0;
+}
+
+static int tc_cleanup_interface(const char *ifname, bool verbose)
+{
+    const char *const argv[] = { "tc", "qdisc", "del", "dev", ifname, "clsact", NULL };
+    int err;
+    int has_clsact;
+
+    if (verbose) {
+        fprintf(stderr, "Cleaning TC hooks on %s...\n", ifname);
+        fprintf(stderr,
+                "note: cleanup removes the clsact qdisc and TC filters on this interface\n");
+    }
+
+    /* For this experimental recorder we intentionally reset the interface's
+     * clsact qdisc with the external tc utility. That removes both ingress and
+     * egress filters attached to clsact and avoids stale state between demo
+     * runs. This is broader than a production TC manager should be.
+     */
+    err = run_tc_command_silent(argv);
+    if (err == 0) {
+        if (verbose)
+            fprintf(stderr, "cleanup complete\n");
+        return 0;
+    }
+
+    has_clsact = tc_qdisc_has_clsact(ifname);
+    if (has_clsact == 0) {
+        if (verbose)
+            fprintf(stderr, "cleanup complete (nothing to remove)\n");
+        return 0;
+    }
+
+    if (verbose) {
+        fprintf(stderr, "failed to clean TC hooks on %s (tc exit=%d)\n", ifname, err);
+        if (geteuid() != 0)
+            fprintf(stderr, "TC cleanup may require elevated privileges; try running with sudo\n");
+    }
+
+    return -1;
+}
+
 static void bpf_timestamp_to_pcap_time(const struct app_state *state,
                                        uint64_t bpf_ts_ns,
                                        uint32_t *ts_sec,
@@ -532,6 +669,7 @@ int main(int argc, char **argv)
     const char *ifname;
     const char *output_path;
     const char *config_path = NULL;
+    bool cleanup_only = false;
     unsigned int ifindex;
     uint32_t config_key = 0;
     struct pcapc_capture_config capture_config = default_capture_config();
@@ -544,22 +682,35 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    ifname = argv[1];
-    output_path = argv[2];
-    if (argc == 5) {
-        if (strcmp(argv[3], "--config") == 0 || strcmp(argv[3], "-c") == 0) {
-            config_path = argv[4];
-        } else {
-            print_usage(argv[0]);
-            return 1;
+    if (argc == 3 && strcmp(argv[1], "--cleanup") == 0) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    if (argc == 3 && strcmp(argv[2], "--cleanup") == 0) {
+        cleanup_only = true;
+        ifname = argv[1];
+        output_path = NULL;
+    } else {
+        ifname = argv[1];
+        output_path = argv[2];
+        if (argc == 5) {
+            if (strcmp(argv[3], "--config") == 0 || strcmp(argv[3], "-c") == 0) {
+                config_path = argv[4];
+            } else {
+                print_usage(argv[0]);
+                return 1;
+            }
         }
     }
 
-    if (config_path) {
-        if (load_config_file(config_path, &capture_config) != 0)
-            return 1;
-    } else {
-        normalize_capture_config("runtime defaults", &capture_config);
+    if (!cleanup_only) {
+        if (config_path) {
+            if (load_config_file(config_path, &capture_config) != 0)
+                return 1;
+        } else {
+            normalize_capture_config("runtime defaults", &capture_config);
+        }
     }
 
     ifindex = if_nametoindex(ifname);
@@ -567,6 +718,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to get ifindex for interface '%s': %s\n",
                 ifname, strerror(errno));
         return 1;
+    }
+
+    if (cleanup_only) {
+        err = tc_cleanup_interface(ifname, true);
+        return err == 0 ? 0 : 1;
     }
 
     state.pcap_file = fopen(output_path, "wb");
@@ -584,6 +740,14 @@ int main(int argc, char **argv)
 
     state.mono_base_ns = clock_ns(CLOCK_MONOTONIC);
     state.real_base_ns = clock_ns(CLOCK_REALTIME);
+
+    err = tc_cleanup_interface(ifname, false);
+    if (err != 0) {
+        fprintf(stderr, "failed to prepare TC hooks on %s\n", ifname);
+        if (geteuid() != 0)
+            fprintf(stderr, "TC cleanup may require elevated privileges; try running with sudo\n");
+        goto cleanup;
+    }
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
@@ -634,6 +798,7 @@ int main(int argc, char **argv)
     err = bpf_tc_hook_create(&hook);
     if (err && err != -EEXIST) {
         fprintf(stderr, "failed to create TC hook: %d\n", err);
+        print_permission_hint("TC hook creation", err);
         goto cleanup;
     }
 
@@ -647,6 +812,9 @@ int main(int argc, char **argv)
     err = bpf_tc_attach(&hook, &ingress_opts);
     if (err) {
         fprintf(stderr, "failed to attach TC ingress program: %d\n", err);
+        print_permission_hint("TC ingress attach", err);
+        fprintf(stderr, "if stale TC state remains, try: sudo %s %s --cleanup\n",
+                argv[0], ifname);
         goto cleanup;
     }
     ingress_attached = true;
@@ -661,6 +829,9 @@ int main(int argc, char **argv)
     err = bpf_tc_attach(&hook, &egress_opts);
     if (err) {
         fprintf(stderr, "failed to attach TC egress program: %d\n", err);
+        print_permission_hint("TC egress attach", err);
+        fprintf(stderr, "if stale TC state remains, try: sudo %s %s --cleanup\n",
+                argv[0], ifname);
         goto cleanup;
     }
     egress_attached = true;
@@ -702,6 +873,9 @@ cleanup:
         hook.attach_point = BPF_TC_INGRESS;
         bpf_tc_detach(&hook, &ingress_opts);
     }
+
+    if (ifname != NULL)
+        tc_cleanup_interface(ifname, false);
 
     ring_buffer__free(rb);
     tcpcap_bpf__destroy(skel);
