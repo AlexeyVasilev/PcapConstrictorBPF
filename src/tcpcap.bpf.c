@@ -31,6 +31,9 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define QUIC_LONG_HEADER_BIT 0x80
 #define QUIC_FIXED_BIT 0x40
+#define QUIC_SHORT_HEADER_KEEP_PACKET_BYTES 32u
+#define QUIC_REQUIRE_DCID_MATCH 1u
+#define QUIC_ALLOW_SHORT_HEADER_WITHOUT_KNOWN_DCID 0u
 #define QUIC_CID_STORE_LEARNED 1
 #define QUIC_CID_STORE_UPDATED 2
 #define QUIC_CID_STORE_FAILED 3
@@ -753,7 +756,8 @@ static PCAPC_NOINLINE __u8 detect_quic_long_header(struct __sk_buff *skb,
 
 static PCAPC_NOINLINE __u8 detect_quic_short_header_by_flow(struct __sk_buff *skb,
                                                             const struct bpf_packet_meta *meta,
-                                                            __u32 parse_limit)
+                                                            __u32 parse_limit,
+                                                            __u8 *matched_dcid_len)
 {
     struct pcapc_quic_flow_key_v4 key = {};
     struct pcapc_quic_flow_value *value;
@@ -765,6 +769,9 @@ static PCAPC_NOINLINE __u8 detect_quic_short_header_by_flow(struct __sk_buff *sk
     __u64 now;
     int i;
 
+    *matched_dcid_len = 0;
+    if (QUIC_REQUIRE_DCID_MATCH == 0u)
+        return 0;
     if (meta->l4_proto != IPPROTO_UDP)
         return 0;
     if (meta->src_port != 443u && meta->dst_port != 443u)
@@ -786,8 +793,11 @@ static PCAPC_NOINLINE __u8 detect_quic_short_header_by_flow(struct __sk_buff *sk
 
     build_quic_flow_key_v4(meta, &key, &src_is_a);
     value = bpf_map_lookup_elem(&quic_flows, &key);
-    if (!value)
+    if (!value) {
+        if (QUIC_ALLOW_SHORT_HEADER_WITHOUT_KNOWN_DCID != 0u)
+            return 0;
         return 0;
+    }
 
     if (src_is_a) {
         expected = &value->endpoint_b_scid;
@@ -821,6 +831,7 @@ static PCAPC_NOINLINE __u8 detect_quic_short_header_by_flow(struct __sk_buff *sk
     now = bpf_ktime_get_ns();
     value->packets++;
     value->last_seen_ns = now;
+    *matched_dcid_len = expected->len;
     stat_inc(STAT_QUIC_SHORT_CANDIDATE);
     stat_inc(STAT_QUIC_SHORT_FLOW_MATCH);
     return 1;
@@ -837,6 +848,9 @@ static PCAPC_NOINLINE int capture_packet(struct __sk_buff *skb, __u8 direction)
     __u32 parse_limit;
     __u32 cap_len;
     __u32 tls_cap_len;
+    __u32 quic_cap_len;
+    __u32 keep_from_quic_payload;
+    __u8 matched_quic_dcid_len;
 
     cfg = load_capture_config();
     default_snaplen = cfg.default_snaplen;
@@ -869,11 +883,30 @@ static PCAPC_NOINLINE int capture_packet(struct __sk_buff *skb, __u8 direction)
         cap_len = COPY_WINDOW_LEN;
 
     parse_packet_headers(skb, parse_limit, &meta);
+    matched_quic_dcid_len = 0;
     if (meta.l4_proto == IPPROTO_UDP) {
         if (detect_quic_long_header(skb, &meta, parse_limit, skb->ifindex))
             meta.reason = PCAPC_REASON_QUIC_LONG;
-        else if (detect_quic_short_header_by_flow(skb, &meta, parse_limit))
+        else if (detect_quic_short_header_by_flow(skb, &meta, parse_limit,
+                                                  &matched_quic_dcid_len)) {
             meta.reason = PCAPC_REASON_QUIC_SHORT_CANDIDATE;
+            keep_from_quic_payload = QUIC_SHORT_HEADER_KEEP_PACKET_BYTES;
+            if (keep_from_quic_payload < 1u + (__u32)matched_quic_dcid_len)
+                keep_from_quic_payload = 1u + (__u32)matched_quic_dcid_len;
+            if ((__u32)meta.payload_off <= 0xffffffffu - keep_from_quic_payload) {
+                quic_cap_len = (__u32)meta.payload_off + keep_from_quic_payload;
+                if (quic_cap_len > pkt_len)
+                    quic_cap_len = pkt_len;
+                if (quic_cap_len > max_capture_len)
+                    quic_cap_len = max_capture_len;
+                if (quic_cap_len > MAX_CAPTURE_LEN)
+                    quic_cap_len = MAX_CAPTURE_LEN;
+                if (quic_cap_len < cap_len) {
+                    cap_len = quic_cap_len;
+                    stat_inc(STAT_QUIC_SHORT_CONSTRICTED);
+                }
+            }
+        }
     } else if (detect_simple_tls_app_data(skb, &meta, parse_limit, &tls_cap_len, &cfg)) {
         cap_len = tls_cap_len;
         meta.reason = PCAPC_REASON_TLS_APP_DATA;
@@ -893,9 +926,10 @@ static PCAPC_NOINLINE int capture_packet(struct __sk_buff *skb, __u8 direction)
     }
 
     /* BPF capture policy stays conservative here: default snaplen for general
-     * traffic, with a later simple TLS AppData override only. QUIC detection
-     * in this path updates metadata and flow state but does not constrain the
-     * copied packet length yet.
+     * traffic, with a later simple TLS AppData override only. QUIC Long
+     * Headers stay on the default policy, while flow-matched QUIC short
+     * headers may be shortened to a small prefix that still includes the full
+     * matched DCID.
      */
     if (cap_len >= MAX_CAPTURE_LEN) {
         cap_len = MAX_CAPTURE_LEN;

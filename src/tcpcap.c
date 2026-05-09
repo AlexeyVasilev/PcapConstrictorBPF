@@ -57,6 +57,7 @@ static const char *const stat_names[STAT_MAX] = {
     [STAT_QUIC_FLOW_UPDATE] = "quic_flow_update",
     [STAT_QUIC_FLOW_STORE_FAILED] = "quic_flow_store_failed",
     [STAT_QUIC_SHORT_FLOW_MATCH] = "quic_short_flow_match",
+    [STAT_QUIC_SHORT_CONSTRICTED] = "quic_short_constricted",
 };
 
 struct event {
@@ -442,7 +443,7 @@ int main(int argc, char **argv)
            argv[1], ifindex, argv[2]);
     printf("SNAPLEN=%d. BPF policy: default snaplen plus simple TLS AppData "
            "constriction; QUIC Long Header CID/flow learning and short-header "
-           "flow matching enabled; QUIC constriction remains disabled. "
+           "flow matching/constriction enabled. "
            "Multi-record TLS remains disabled. "
            "Press Ctrl+C to stop.\n",
            SNAPLEN);
