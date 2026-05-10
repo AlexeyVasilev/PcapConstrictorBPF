@@ -1,15 +1,22 @@
 # PcapConstrictorBPF
 
-PcapConstrictorBPF is an experimental Linux TC eBPF packet recorder that writes
-classic PCAP files while applying small adaptive capture policies in kernel
-space.
+PcapConstrictorBPF is an experimental Linux TC eBPF packet recorder that
+captures traffic into classic PCAP files and applies a small subset of
+TLS/QUIC-aware constriction during live capture.
 
-This repository is related to PcapConstrictor, but it is not intended to
-replace it. PcapConstrictor remains the more robust offline and
-production-style packet constriction project. PcapConstrictorBPF is narrower
+It is related to
+[PcapConstrictor](https://github.com/AlexeyVasilev/PcapConstrictor), but it is
+not intended to replace it. The main PcapConstrictor project remains the more
+robust offline PCAP/PCAPNG constriction tool. PcapConstrictorBPF is narrower
 and more educational: it is useful for learning TC hooks, verifier-friendly BPF
-parsing, BPF maps, and adaptive capture policy. For a practical live-capture
-path, an AF_PACKET-based recorder would likely be a better long-term approach.
+parsing, BPF maps, and adaptive capture policy.
+
+## Status
+
+Experimental project. The recorder is functional on Linux and
+demonstrates TC eBPF-based adaptive capture, BPF maps, verifier-friendly packet
+parsing, and runtime policy configuration. It intentionally implements a
+narrower policy than PcapConstrictor.
 
 ## Current capabilities
 
@@ -96,6 +103,12 @@ Expected dependencies:
 - `tc` / `iproute2`
 - `libelf` and `zlib`
 
+## Tested environment
+
+Developed and tested on Ubuntu in a VirtualBox Linux VM with a BPF-capable
+kernel, `clang`, `bpftool`, `libbpf`, and `iproute2` / `tc`. Other kernels or
+toolchains may require small adjustments.
+
 ## Usage
 
 Default capture:
@@ -107,7 +120,7 @@ sudo ./tcpcap enp0s3 out.pcap
 Capture with config:
 
 ```sh
-sudo ./tcpcap enp0s3 out.pcap --config config.example.ini
+sudo ./tcpcap enp0s3 out.pcap --config config.ini
 ```
 
 Cleanup:
@@ -127,7 +140,7 @@ sudo tc filter show dev enp0s3 egress
 ## Configuration
 
 Runtime policy is loaded from `config.ini` into `pcapc_capture_config`.
-[`config.example.ini`](C:\My2\Projects\C++\PcapConstrictorBPF\PcapConstrictorBPF\config.example.ini)
+[`config.example.ini`](config.example.ini)
 shows the supported format.
 
 Supported keys:
@@ -188,4 +201,9 @@ Notes:
 This repository is intentionally narrower and more experimental than
 PcapConstrictor. It is a good vehicle for exploring eBPF, TC hooks, verifier
 constraints, BPF maps, and adaptive live capture policy. For robust offline
-PCAP constriction and richer protocol handling, use PcapConstrictor.
+PCAP/PCAPNG constriction and richer protocol handling, use
+[PcapConstrictor](https://github.com/AlexeyVasilev/PcapConstrictor).
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
