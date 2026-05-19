@@ -9,14 +9,30 @@ It is related to
 not intended to replace it. The main PcapConstrictor project remains the more
 robust offline PCAP/PCAPNG constriction tool. PcapConstrictorBPF is narrower
 and more educational: it is useful for learning TC hooks, verifier-friendly BPF
-parsing, BPF maps, and adaptive capture policy.
+parsing, BPF maps, ring buffers, and adaptive capture policy.
+
+For practical Linux live capture, use
+[PcapConstrictorAFPacket](https://github.com/AlexeyVasilev/PcapConstrictorAFPacket).
+PcapConstrictorBPF is intentionally limited by eBPF verifier constraints and
+should be understood as a research project rather than the main
+recommended live recorder.
 
 ## Status
 
-Experimental project. The recorder is functional on Linux and
-demonstrates TC eBPF-based adaptive capture, BPF maps, verifier-friendly packet
-parsing, and runtime policy configuration. It intentionally implements a
-narrower policy than PcapConstrictor.
+Experimental / research-oriented project. The recorder is functional on Linux
+and demonstrates TC eBPF-based adaptive capture, BPF maps, verifier-friendly
+packet parsing, and runtime policy configuration. It intentionally implements a
+much narrower policy than PcapConstrictor and
+PcapConstrictorAFPacket.
+
+## Project family
+
+| Project | Role | Use when |
+|---|---|---|
+| [PcapConstrictor](https://github.com/AlexeyVasilev/PcapConstrictor) | Main offline PCAP/PCAPNG constriction tool | You already have capture files and want the richest policy support, including TLS final_only/stream/bulk, QUIC, PCAPNG, reinflate/restore, checksum policies, stats, and decision logs. |
+| [PcapConstrictorAFPacket](https://github.com/AlexeyVasilev/PcapConstrictorAFPacket) | Linux AF_PACKET live recorder | You want practical Linux live capture with userspace PcapConstrictor-style policy. Supports TLS final_only and QUIC CID-aware short-header constriction, but not TLS stream/bulk. |
+| [PcapConstrictorWinPacket](https://github.com/AlexeyVasilev/PcapConstrictorWinPacket) | Windows Npcap/libpcap live recorder | You want practical Windows live capture with Npcap and similar policy scope to AFPacket. Supports TLS final_only and QUIC known-DCID constriction, but not TLS stream/bulk. |
+| [PcapConstrictorBPF](https://github.com/AlexeyVasilev/PcapConstrictorBPF) | Experimental Linux TC eBPF recorder | You want a research eBPF project demonstrating TC hooks, BPF maps, verifier-friendly parsing, and a much smaller live-capture policy subset. |
 
 ## Current capabilities
 
@@ -41,12 +57,19 @@ narrower policy than PcapConstrictor.
   - `cap_len = payload_off + max(quic_short_header_keep_packet_bytes, 1 + matched_dcid_len)`
 - Aggregate shutdown stats.
 
+Compared with the AF_PACKET and offline projects, TLS reduction here is much
+smaller and QUIC support is narrower. That is expected: the BPF path favors
+simple verifier-friendly parsing over deep continuation handling.
+
 ## Limitations / non-goals
 
 - Linux only.
 - Requires root or equivalent capabilities such as `CAP_NET_ADMIN`.
 - Uses TC `clsact` hooks.
 - Experimental, verifier-friendly eBPF implementation.
+- Not the recommended practical live recorder.
+- BPF verifier constraints intentionally limit policy depth and protocol
+  handling.
 - QUIC flow state is currently IPv4-focused.
 - No QUIC decryption.
 - No QUIC frame parsing.
@@ -56,6 +79,10 @@ narrower policy than PcapConstrictor.
 - No multi-record TLS constriction in BPF.
 - TLS support is intentionally limited to simple AppData records at TCP payload
   start.
+- TLS continuation handling is intentionally much narrower than
+  PcapConstrictor and PcapConstrictorAFPacket.
+- QUIC handling is intentionally narrower than PcapConstrictor and
+  PcapConstrictorAFPacket.
 - Large packets are capped by `MAX_CAPTURE_LEN=4096` in the current build.
 - Cleanup removes the `clsact` qdisc and therefore the TC filters attached to
   it on that interface. That is acceptable for this demo project, but should be
@@ -78,6 +105,10 @@ Main BPF maps:
 - `quic_cids`: learned QUIC CID diagnostics
 - `quic_flows`: QUIC flow state for directional CID matching
 - scratch maps used to keep the BPF stack verifier-friendly
+
+This repository is a good fit if you want to study how a TC eBPF design is put
+together end to end: attach points, BPF maps, ring buffer events, compact
+metadata parsing, and policy decisions that stay within verifier constraints.
 
 ## Build
 
@@ -120,7 +151,7 @@ sudo ./tcpcap enp0s3 out.pcap
 Capture with config:
 
 ```sh
-sudo ./tcpcap enp0s3 out.pcap --config config.ini
+sudo ./tcpcap enp0s3 out.pcap --config config.example.ini
 ```
 
 Cleanup:
@@ -166,6 +197,9 @@ Notes:
 - `allow_short_header_without_known_dcid` is currently fixed to `false`.
 - Those keys are included for policy clarity and future compatibility.
 - Capture values cannot exceed the current build limit `MAX_CAPTURE_LEN=4096`.
+- The config surface matches the current BPF-supported feature subset; it does
+  not expose TLS stream/bulk modes or PCAPNG output because those are outside
+  the scope of this recorder.
 
 ## Shutdown stats
 
@@ -196,14 +230,8 @@ Notes:
 - `quic_short_constricted` counts matched Short Header packets that were
   actually shortened.
 
-## Relationship to PcapConstrictor
-
-This repository is intentionally narrower and more experimental than
-PcapConstrictor. It is a good vehicle for exploring eBPF, TC hooks, verifier
-constraints, BPF maps, and adaptive live capture policy. For robust offline
-PCAP/PCAPNG constriction and richer protocol handling, use
-[PcapConstrictor](https://github.com/AlexeyVasilev/PcapConstrictor).
-
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
+
+Copyright 2026 Alexey Vasilev.
